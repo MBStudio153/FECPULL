@@ -1,1 +1,93 @@
+name: fec-house-data5d
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        cycle: [2020,2022]
+    steps:
+      - name: OpenFEC, House independent expenditures by district, cycles 2020 and 2022, one cycle per job
+        continue-on-error: true
+        env:
+          FEC_API_KEY: ${{ secrets.FEC_API_KEY }}
+          CYCLE: ${{ matrix.cycle }}
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, os, time, requests
+          S = requests.Session(); S.headers.update({"User-Agent": "kaim-research/1.0 (info@kaimresearch.com)"})
+          KEY = os.environ["FEC_API_KEY"]
+          def clean(t): return str(t).replace(KEY, "***")
+          cyc = int(os.environ["CYCLE"]); B = "https://api.open.fec.gov/v1"
+          log = open("out/log.txt", "w"); rows = []; calls = [0]
+          def get(path, p):
+              for a in range(5):
+                  time.sleep(8); calls[0] += 1
+                  try:
+                      r = S.get(B + path, params=dict(p, api_key=KEY), timeout=120)
+                  except Exception as e:
+                      log.write("%s attempt %d %s\n" % (path, a, clean(repr(e))[:200])); log.flush(); time.sleep(30); continue
+                  if r.status_code == 200: return r.json()
+                  log.write("%s %s attempt %d HTTP %d %s\n" % (path, p.get("state"), a, r.status_code, clean(r.text)[:160].replace("\n", " "))); log.flush()
+                  if r.status_code == 422: return None
+                  time.sleep(90 * (a + 1) if r.status_code == 429 else 30)
+              return None
+          # 1. the list of House districts for this cycle, taken from the FEC itself
+          dists = set(); page = 1
+          while True:
+              d = get("/elections/search/", {"cycle": cyc, "office": "house", "per_page": 100, "page": page})
+              if not d: break
+              for x in d.get("results", []):
+                  if x.get("state") and x.get("district") is not None: dists.add((x["state"], str(x["district"]).zfill(2)))
+              n = d.get("pagination", {}).get("pages", 1)
+              log.write("districts page %d/%d total %d\n" % (page, n, len(dists))); log.flush()
+              if page >= n: break
+              page += 1
+          dists = sorted(dists)
+          json.dump(dists, open("out/districts_%d.json" % cyc, "w"))
+          log.write("DISTRICTS %d\n" % len(dists)); log.flush()
+          # 2. independent expenditures for each district
+          for k, (st, di) in enumerate(dists):
+              page = 1
+              while True:
+                  d = get("/schedules/schedule_e/by_candidate/", {"per_page": 100, "page": page, "cycle": cyc, "election_full": "true", "office": "house", "state": st, "district": di, "sort": "-total"})
+                  if not d: break
+                  for x in d.get("results", []): x["_office"] = "house"; x["_state"] = st; x["_district"] = di
+                  rows += d.get("results", []); n = d.get("pagination", {}).get("pages", 1)
+                  if page >= n or page >= 20: break
+                  page += 1
+              log.write("%s-%s rows %d calls %d (%d/%d)\n" % (st, di, len(rows), calls[0], k + 1, len(dists))); log.flush()
+              json.dump(rows, open("out/ieh_%d.json" % cyc, "w"))
+          json.dump(rows, open("out/ieh_%d.json" % cyc, "w"))
+          PY
+          python3 q.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fec-house-data5d-${{ matrix.cycle }}
+          path: out/
+  collect:
+    needs: fetch
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: fec-house-data5d-*
+          path: all
+      - name: Zip and commit
+        run: |
+          mkdir -p data/zips
+          cd all && zip -r ../data/zips/fec-house-data5d.zip . && cd ..
+          git config user.name "github-actions"; git config user.email "actions@users.noreply.github.com"
+          git add data/zips/fec-house-data5d.zip
+          git commit -m "Fetch FEC house5d" || true
+          git push || true
 
