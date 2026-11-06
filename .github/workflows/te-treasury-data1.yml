@@ -1,1 +1,35 @@
+name: te-treasury-data1
+on:
+  workflow_dispatch:
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download Treasury tax expenditure reports
+        run: |
+          mkdir -p out
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+          for Y in $(seq 2008 2027); do
+            ok=0
+            for U in \
+              "https://home.treasury.gov/system/files/131/Tax-Expenditures-FY${Y}.pdf" \
+              "https://www.treasury.gov/resource-center/tax-policy/Documents/Tax-Expenditures-FY${Y}.pdf" \
+              "https://home.treasury.gov/system/files/131/Tax-Expenditures-FY${Y}-2.pdf" \
+              "https://home.treasury.gov/system/files/131/Tax-Expenditures-FY${Y}-ver2.pdf"; do
+              code=$(curl -sL -A "$UA" -m 120 -o "out/Tax-Expenditures-FY${Y}.pdf" -w "%{http_code}" "$U" || true)
+              size=$(stat -c %s "out/Tax-Expenditures-FY${Y}.pdf" 2>/dev/null || echo 0)
+              echo "FY${Y} $U -> $code $size" | tee -a out/log.txt
+              if [ "$code" = "200" ] && [ "$size" -gt 100000 ]; then ok=1; break; fi
+              rm -f "out/Tax-Expenditures-FY${Y}.pdf"
+              sleep 3
+            done
+            [ "$ok" = "1" ] || echo "FY${Y} MISSING" | tee -a out/log.txt
+            sleep 5
+          done
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: te-treasury-data1
+          path: out
 
