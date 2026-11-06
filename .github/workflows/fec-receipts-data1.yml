@@ -1,1 +1,34 @@
+name: fec-receipts-data1
+on:
+  workflow_dispatch:
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download FEC bulk summary files (candidates and PAC/party)
+        run: |
+          mkdir -p out
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+          for Y in 2008 2010 2012 2014 2016 2018 2020 2022 2024 2026; do
+            YY=${Y:2:2}
+            for F in weball webl pas2 ; do
+              U="https://www.fec.gov/files/bulk-downloads/${Y}/${F}${YY}.zip"
+              code=$(curl -sL -A "$UA" -m 300 -o "out/${F}${YY}.zip" -w "%{http_code}" "$U" || true)
+              size=$(stat -c %s "out/${F}${YY}.zip" 2>/dev/null || echo 0)
+              echo "${F}${YY} $U -> $code $size" | tee -a out/log.txt
+              [ "$code" = "200" ] || rm -f "out/${F}${YY}.zip"
+              sleep 2
+            done
+            U="https://www.fec.gov/files/bulk-downloads/${Y}/webk${YY}.zip"
+            code=$(curl -sL -A "$UA" -m 300 -o "out/webk${YY}.zip" -w "%{http_code}" "$U" || true)
+            echo "webk${YY} $U -> $code" | tee -a out/log.txt
+            [ "$code" = "200" ] || rm -f "out/webk${YY}.zip"
+            sleep 2
+          done
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fec-receipts-data1
+          path: out
 
