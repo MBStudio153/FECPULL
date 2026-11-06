@@ -1,1 +1,63 @@
+name: gdelt-fill-data3a
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include: [{"term": "municipal bankruptcy", "grp": "muni", "years": "2020,2021,2022,2023,2024,2025,2026"}, {"term": "drone strike", "grp": "drone", "years": "2025,2026"}]
+    steps:
+      - name: GDELT DOC API, last missing municipal bankruptcy and drone strike years, slow pacing
+        continue-on-error: true
+        env:
+          TERM_: ${{ matrix.term }}
+          YEARS_: ${{ matrix.years }}
+          GRP_: ${{ matrix.grp }}
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import os, random, re, time, urllib.request, urllib.parse
+          term = os.environ["TERM_"]
+          slug = re.sub("[^a-z0-9]+", "_", term.lower()).strip("_")
+          log = open("out/log.txt", "w")
+          time.sleep(random.random() * 120)
+          q = '"%s" sourcelang:english' % term
+          for yr in [int(y) for y in os.environ["YEARS_"].split(",")]:
+              start = "%d0101000000" % yr
+              end = time.strftime("%Y%m%d235959") if yr >= 2026 else "%d1231235959" % yr
+              params = {"query": q, "mode": "timelinevolraw", "format": "json", "timelinesmooth": "0", "startdatetime": start, "enddatetime": end}
+              url = "https://api.gdeltproject.org/api/v2/doc/doc?" + urllib.parse.urlencode(params)
+              err = ""
+              for a in range(8):
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": "kaim-research/1.0"})
+                      r = urllib.request.urlopen(req, timeout=180).read().decode("utf-8", "replace")
+                      if r.startswith("{"):
+                          open("out/topic_%s__%s_%d.json" % (os.environ["GRP_"], slug, yr), "w").write(r)
+                          log.write("%s %d ok len=%d\n" % (slug, yr, len(r))); log.flush()
+                          break
+                      err = r[:80]
+                  except Exception as e:
+                      err = repr(e)[:120]
+                  log.write("%s %d attempt %d %s\n" % (slug, yr, a, err)); log.flush()
+                  time.sleep(300)
+              time.sleep(45)
+          log.close()
+          PY
+          python3 q.py
+      - name: Name the artifact
+        if: always()
+        run: echo "ART=$(echo "$TERM_" | tr -c 'a-zA-Z0-9\n' '_')" >> $GITHUB_ENV
+        env:
+          TERM_: ${{ matrix.term }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gdelt-fill3a-${{ env.ART }}
+          path: out/
 
