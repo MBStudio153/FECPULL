@@ -1,1 +1,142 @@
+# esef_pilot_v2.yml  (v2: adds a first "check" job that says exactly which script
+# files are missing from the repo, and creates the out folder before summarizing)
+#
+# Put this file in your repo at:  .github/workflows/esef_pilot_v2.yml
+# Put the four scripts in a folder named esef_pilot/ at the repo root:
+#   esef_pilot/esef_pull_v1.py
+#   esef_pilot/esef_summary_v1.py
+#   esef_pilot/sec_germany_scan_v1.py
+#   esef_pilot/german_index_names_v1.txt
+#
+# Start it from the Actions tab: choose "ESEF pilot v2", tap "Run workflow",
+# and type your business email in the contact box.
+
+name: ESEF pilot v2
+
+on:
+  workflow_dispatch:
+    inputs:
+      contact:
+        description: "Contact email for the User-Agent (use your business address; blank = ESEF_CONTACT secret)"
+        required: false
+        default: ""
+      run_sec_scan:
+        description: "Also run the SEC Germany scan (about 20-30 min)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check scripts and contact
+        env:
+          CONTACT: ${{ inputs.contact || secrets.ESEF_CONTACT }}
+        run: |
+          missing=0
+          for f in esef_pull_v1.py esef_summary_v1.py sec_germany_scan_v1.py german_index_names_v1.txt; do
+            if [ ! -f "esef_pilot/$f" ]; then echo "MISSING: esef_pilot/$f"; missing=1; fi
+          done
+          if [ "$missing" = 1 ]; then
+            echo "---- files that ARE in the repo ----"
+            find . -path ./.git -prune -o -type f -print | head -60
+            exit 1
+          fi
+          if [ -z "$CONTACT" ]; then echo "MISSING: type your business email in the contact box (or set the ESEF_CONTACT secret)"; exit 1; fi
+          echo "scripts found and contact set"
+
+  pull:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        year: [2020, 2021, 2022, 2023, 2024, 2025]
+        group: [g1, g2]
+        include:
+          - group: g1
+            countries: "FR,DE,ES,SE,FI,NO,AT,PT,LU,HU,HR,SK"
+          - group: g2
+            countries: "GB,IT,NL,DK,PL,BE,IE,GR,CZ,RO,LT,IS"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Pull ${{ matrix.year }} / ${{ matrix.group }}
+        env:
+          CONTACT: ${{ inputs.contact || secrets.ESEF_CONTACT }}
+        run: |
+          python esef_pilot/esef_pull_v1.py run \
+            --year ${{ matrix.year }} \
+            --countries "${{ matrix.countries }}" \
+            --tag ${{ matrix.group }} \
+            --contact "$CONTACT" \
+            --out out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: esef-${{ matrix.year }}-${{ matrix.group }}
+          path: out/
+          if-no-files-found: ignore
+
+  summary:
+    needs: pull
+    if: ${{ !cancelled() && needs.pull.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: esef-*
+          merge-multiple: true
+          path: out
+      - name: Summarize
+        run: |
+          mkdir -p out
+          python esef_pilot/esef_summary_v1.py --dir out | tee out/summary_printout.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: esef-summary
+          path: |
+            out/summary_by_country.csv
+            out/concept_candidates.csv
+            out/anomalies.csv
+            out/summary_printout.txt
+            out/country_counts_*.csv
+
+  sec_scan:
+    needs: check
+    if: ${{ inputs.run_sec_scan }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Scan SEC for German filers
+        env:
+          CONTACT: ${{ inputs.contact || secrets.ESEF_CONTACT }}
+        run: |
+          python esef_pilot/sec_germany_scan_v1.py \
+            --contact "$CONTACT" \
+            --names esef_pilot/german_index_names_v1.txt \
+            --out sec_scan_out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sec-germany-scan
+          path: sec_scan_out/
+          if-no-files-found: ignore
 
