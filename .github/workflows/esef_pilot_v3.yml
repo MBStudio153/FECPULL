@@ -1,1 +1,1025 @@
+# esef_pilot_v3.yml  -  ONE-FILE version: the four scripts are inside this workflow.
+# Save it in your repo as:  .github/workflows/esef_pilot_v3.yml
+# Then: Actions tab > "ESEF pilot v3" > Run workflow > type your business email in
+# the contact box > Run workflow. No other files are needed.
+#
+# 12 pull jobs (6 period-end years x 2 country groups) start at the same time, then
+# a summary job combines them. The SEC Germany scan runs as its own job.
+# Results: open the finished run and download the files under "Artifacts"
+# (start with "esef-summary").
+
+name: ESEF pilot v3
+
+on:
+  workflow_dispatch:
+    inputs:
+      contact:
+        description: "Contact email for the User-Agent (use your business address)"
+        required: false
+        default: ""
+      run_sec_scan:
+        description: "Also run the SEC Germany scan (about 20-30 min)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check contact
+        env:
+          CONTACT: ${{ inputs.contact || secrets.ESEF_CONTACT }}
+        run: |
+          if [ -z "$CONTACT" ]; then echo "Type your business email in the contact box when you tap Run workflow"; exit 1; fi
+      - name: Write scripts
+        run: |
+          mkdir -p esef_pilot
+          cat > esef_pilot/esef_pull_v1.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          esef_pull_v1.py  -  pilot pull of ESEF/UKSEF facts from filings.xbrl.org
+
+          Two subcommands:
+
+            run     One small run: one calendar year of period-end dates, optionally a
+                    subset of countries. Writes CSVs into --out.
+            launch  Starts many `run` processes at the same time (years x country groups)
+                    so the whole pull finishes in well under an hour.
+
+          Standard library only (no pip installs needed). Python 3.9+.
+
+          Examples
+            python esef_pull_v1.py launch --contact info@example.com --out esef_out
+            python esef_pull_v1.py run --year 2023 --countries DE,IE --contact info@example.com --out esef_out
+
+          Use your own business contact in --contact. filings.xbrl.org asks regular
+          users to put contact details in the User-Agent.
+
+          What it extracts from each filing's xBRL-JSON (kind column):
+            rd_expense       ifrs-full:ResearchAndDevelopmentExpense
+            shares           ifrs-full:NumberOfSharesOutstanding / NumberOfSharesIssued
+            rd_candidate     any other concept with "research" or "development" in its name
+            capdev_candidate "Additions" concepts about intangibles where the concept or a
+                             dimension member mentions internally generated / development
+          The candidates exist so you can see which elements companies really use for
+          capitalized development; esef_summary_v1.py ranks them.
+          """
+
+          import argparse
+          import csv
+          import gzip
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import threading
+          import time
+          from collections import Counter
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from datetime import date, timedelta
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import quote, urljoin
+          from urllib.request import Request, urlopen
+
+          DEFAULT_BASE = "https://filings.xbrl.org"
+
+          # Ordered roughly by expected filing volume so round-robin splitting balances runs.
+          TARGET = ["FR", "GB", "DE", "IT", "ES", "NL", "SE", "DK", "FI", "PL", "NO", "BE",
+                    "AT", "IE", "PT", "GR", "LU", "CZ", "HU", "RO", "HR", "LT", "SK", "IS"]
+
+          EXACT = {
+              "ifrs-full:ResearchAndDevelopmentExpense": "rd_expense",
+              "ifrs-full:NumberOfSharesOutstanding": "shares",
+              "ifrs-full:NumberOfSharesIssued": "shares",
+          }
+          RD_PAT = re.compile(r"research|development", re.I)
+          ADD_PAT = re.compile(r"additions", re.I)
+          INTANG_PAT = re.compile(r"intangible", re.I)
+          DIM_PAT = re.compile(r"internallygenerated|development", re.I)
+          CORE_DIMS = {"concept", "entity", "period", "unit", "language"}
+
+          FACT_FIELDS = ["filing_id", "country", "entity_id", "entity_name", "kind", "concept",
+                         "value", "unit", "decimals", "period_start", "period_end", "days", "dims"]
+          FILING_FIELDS = ["filing_id", "country", "entity_id", "entity_name", "period_end",
+                           "processed", "json_url", "n_facts"]
+
+
+          # ----------------------------------------------------------------------------
+          # HTTP
+          # ----------------------------------------------------------------------------
+          def http_get(url, ua, retries=5, timeout=90):
+              delay = 1.0
+              last = None
+              for _ in range(retries):
+                  try:
+                      req = Request(url, headers={"User-Agent": ua, "Accept-Encoding": "gzip"})
+                      with urlopen(req, timeout=timeout) as r:
+                          data = r.read()
+                          if r.headers.get("Content-Encoding") == "gzip":
+                              data = gzip.decompress(data)
+                          return data
+                  except HTTPError as e:
+                      if e.code in (429, 500, 502, 503, 504):
+                          last = e
+                          time.sleep(delay)
+                          delay *= 2
+                          continue
+                      raise
+                  except (URLError, TimeoutError, ConnectionError) as e:
+                      last = e
+                      time.sleep(delay)
+                      delay *= 2
+              raise RuntimeError("failed after %d tries: %s (%s)" % (retries, url, last))
+
+
+          # ----------------------------------------------------------------------------
+          # Index
+          # ----------------------------------------------------------------------------
+          def first(d, *keys):
+              for k in keys:
+                  v = d.get(k)
+                  if v not in (None, ""):
+                      return v
+              return None
+
+
+          def load_index(year, base, ua):
+              raw = http_get("%s/indexes/filings-%s.json" % (base, year), ua)
+              doc = json.loads(raw)
+              ents = {}
+              for inc in doc.get("included", []) or []:
+                  if inc.get("type") == "entity":
+                      ents[inc.get("id")] = inc.get("attributes", {}) or {}
+              rows = []
+              for d in doc.get("data", []) or []:
+                  a = d.get("attributes", {}) or {}
+                  rel = ((d.get("relationships") or {}).get("entity") or {}).get("data") or {}
+                  eid = rel.get("id")
+                  e = ents.get(eid, {})
+                  rows.append({
+                      "filing_id": d.get("id"),
+                      "country": (first(a, "country") or "").upper(),
+                      "entity_id": first(e, "identifier") or eid,
+                      "entity_name": first(e, "name") or "",
+                      "period_end": first(a, "period_end", "last_end_date"),
+                      "processed": first(a, "processed", "processed_time", "published", "added_time") or "",
+                      "json_url": first(a, "json_url"),
+                  })
+              if rows:
+                  print("index sample keys (first filing attributes): %s"
+                        % sorted((doc["data"][0].get("attributes") or {}).keys()), file=sys.stderr)
+              return rows
+
+
+          def api_count(country, base, ua):
+              url = "%s/api/filings?filter[country]=%s&page[size]=1" % (base, country)
+              doc = json.loads(http_get(quote(url, safe=":/?[]=&"), ua, retries=2))
+              meta = doc.get("meta") or {}
+              cnt = first(meta, "count", "total", "total_count")
+              return cnt if cnt is not None else len(doc.get("data", []))
+
+
+          def dedupe(rows):
+              """Keep the latest-processed filing per (entity, period_end)."""
+              best = {}
+              for r in rows:
+                  k = (r["entity_id"], r["period_end"])
+                  if k not in best or (r["processed"] or "") > (best[k]["processed"] or ""):
+                      best[k] = r
+              return list(best.values())
+
+
+          # ----------------------------------------------------------------------------
+          # Facts
+          # ----------------------------------------------------------------------------
+          def parse_period(p):
+              """xBRL-JSON period: instant 'YYYY-MM-DD..' or duration 'start/end' (end exclusive)."""
+              if not p:
+                  return None, None, None
+              try:
+                  if "/" in p:
+                      s, e = p.split("/", 1)
+                      sd = date.fromisoformat(s[:10])
+                      ed = date.fromisoformat(e[:10])
+                      if e[10:].startswith("T00:00") or len(e) == 10:
+                          ed = ed - timedelta(days=1)  # exclusive end -> last day of period
+                      return sd.isoformat(), ed.isoformat(), (ed - sd).days + 1
+                  d = date.fromisoformat(p[:10])
+                  return "", d.isoformat(), 0
+              except ValueError:
+                  return None, None, None
+
+
+          def classify(concept, dims):
+              if concept in EXACT:
+                  return EXACT[concept]
+              local = concept.split(":", 1)[-1]
+              if ADD_PAT.search(local) and INTANG_PAT.search(local):
+                  if DIM_PAT.search(local) or any(DIM_PAT.search(str(v)) for v in dims.values()):
+                      return "capdev_candidate"
+              if RD_PAT.search(local):
+                  return "rd_candidate"
+              return None
+
+
+          def parse_facts(doc, f):
+              facts = doc.get("facts", {})
+              it = facts.values() if isinstance(facts, dict) else facts
+              out = []
+              for fact in it:
+                  dimsfull = fact.get("dimensions") or {}
+                  concept = dimsfull.get("concept")
+                  if not concept:
+                      continue
+                  extra = {k: v for k, v in dimsfull.items() if k not in CORE_DIMS}
+                  kind = classify(concept, extra)
+                  if not kind:
+                      continue
+                  val = fact.get("value")
+                  try:
+                      float(val)
+                  except (TypeError, ValueError):
+                      continue
+                  ps, pe, days = parse_period(dimsfull.get("period"))
+                  out.append({
+                      "filing_id": f["filing_id"], "country": f["country"],
+                      "entity_id": f["entity_id"], "entity_name": f["entity_name"],
+                      "kind": kind, "concept": concept, "value": val,
+                      "unit": dimsfull.get("unit", ""), "decimals": fact.get("decimals", ""),
+                      "period_start": ps, "period_end": pe, "days": days,
+                      "dims": json.dumps(extra, sort_keys=True) if extra else "",
+                  })
+              return out
+
+
+          def process_filing(f, base, ua):
+              url = urljoin(base + "/", f["json_url"])
+              doc = json.loads(http_get(url, ua, timeout=180))
+              return parse_facts(doc, f)
+
+
+          # ----------------------------------------------------------------------------
+          # run
+          # ----------------------------------------------------------------------------
+          def cmd_run(a):
+              ua = "%s %s" % (a.client, a.contact)
+              os.makedirs(a.out, exist_ok=True)
+              tag = a.tag or "all"
+              countries = [c.strip().upper() for c in a.countries.split(",")] if a.countries else TARGET
+              base = a.base.rstrip("/")
+
+              try:
+                  rows = load_index(a.year, base, ua)
+              except HTTPError as e:
+                  if e.code == 404:
+                      print("[%s/%s] no index for year %s (404)" % (a.year, tag, a.year))
+                      return 0
+                  raise
+
+              counts = Counter(r["country"] for r in rows)
+              with open(os.path.join(a.out, "country_counts_%s_%s.csv" % (a.year, tag)), "w", newline="") as fh:
+                  w = csv.writer(fh)
+                  w.writerow(["country", "filings_in_index"])
+                  for c, n in sorted(counts.items()):
+                      w.writerow([c, n])
+              print("[%s/%s] index: %d filings, %d countries" % (a.year, tag, len(rows), len(counts)))
+              for c in countries:
+                  n = counts.get(c, 0)
+                  line = "[%s/%s]   %s: %d in index" % (a.year, tag, c, n)
+                  if n == 0 and a.api_check and c in ("DE", "IE"):
+                      try:
+                          line += "  | API check (all years): %s" % api_count(c, base, ua)
+                      except Exception as e:  # noqa
+                          line += "  | API check failed: %s" % e
+                  print(line)
+
+              sel = dedupe([r for r in rows if r["country"] in countries])
+              nojson = [r for r in sel if not r["json_url"]]
+              sel = [r for r in sel if r["json_url"]]
+              print("[%s/%s] selected %d filings after de-dup (%d without json_url skipped)"
+                    % (a.year, tag, len(sel), len(nojson)))
+
+              facts_path = os.path.join(a.out, "facts_%s_%s.csv" % (a.year, tag))
+              filings_path = os.path.join(a.out, "filings_%s_%s.csv" % (a.year, tag))
+              errors_path = os.path.join(a.out, "errors_%s_%s.csv" % (a.year, tag))
+              done_path = os.path.join(a.out, "done_%s_%s.txt" % (a.year, tag))
+
+              done = set()
+              if os.path.exists(done_path):
+                  with open(done_path) as fh:
+                      done = {l.strip() for l in fh if l.strip()}
+              todo = [r for r in sel if r["filing_id"] not in done]
+              print("[%s/%s] %d already done, %d to fetch" % (a.year, tag, len(done), len(todo)))
+
+              def open_csv(path, fields):
+                  new = not os.path.exists(path)
+                  fh = open(path, "a", newline="", encoding="utf-8")
+                  w = csv.DictWriter(fh, fieldnames=fields)
+                  if new:
+                      w.writeheader()
+                  return fh, w
+
+              ffh, fw = open_csv(facts_path, FACT_FIELDS)
+              gfh, gw = open_csv(filings_path, FILING_FIELDS)
+              efh, ew = open_csv(errors_path, ["filing_id", "country", "entity_name", "json_url", "error"])
+              dfh = open(done_path, "a")
+              lock = threading.Lock()
+              t0 = time.time()
+              ok = bad = 0
+
+              def work(r):
+                  time.sleep(a.delay)
+                  return r, process_filing(r, base, ua)
+
+              with ThreadPoolExecutor(max_workers=a.workers) as ex:
+                  futs = {ex.submit(work, r): r for r in todo}
+                  for i, fut in enumerate(as_completed(futs), 1):
+                      r = futs[fut]
+                      try:
+                          _, facts = fut.result()
+                          with lock:
+                              fw.writerows(facts)
+                              gw.writerow({**{k: r.get(k) for k in FILING_FIELDS if k != "n_facts"},
+                                           "n_facts": len(facts)})
+                              dfh.write(r["filing_id"] + "\n")
+                              for fh_ in (ffh, gfh, dfh):
+                                  fh_.flush()
+                          ok += 1
+                      except Exception as e:  # noqa
+                          with lock:
+                              ew.writerow({"filing_id": r["filing_id"], "country": r["country"],
+                                           "entity_name": r["entity_name"], "json_url": r["json_url"],
+                                           "error": str(e)[:300]})
+                              efh.flush()
+                          bad += 1
+                      if i % 100 == 0:
+                          print("[%s/%s] %d/%d done (%d errors) %.0fs"
+                                % (a.year, tag, i, len(todo), bad, time.time() - t0))
+              for fh_ in (ffh, gfh, efh, dfh):
+                  fh_.close()
+              print("[%s/%s] finished: %d ok, %d errors, %.0fs" % (a.year, tag, ok, bad, time.time() - t0))
+              return 0
+
+
+          # ----------------------------------------------------------------------------
+          # launch
+          # ----------------------------------------------------------------------------
+          def cmd_launch(a):
+              years = list(range(a.first_year, a.last_year + 1))
+              groups = [[] for _ in range(a.groups)]
+              for i, c in enumerate(TARGET):
+                  groups[i % a.groups].append(c)
+              os.makedirs(a.out, exist_ok=True)
+              logdir = os.path.join(a.out, "logs")
+              os.makedirs(logdir, exist_ok=True)
+              procs = []
+              for y in years:
+                  for gi, g in enumerate(groups):
+                      tag = "g%d" % (gi + 1)
+                      cmd = [sys.executable, os.path.abspath(__file__), "run", "--year", str(y),
+                             "--countries", ",".join(g), "--tag", tag, "--contact", a.contact,
+                             "--out", a.out, "--workers", str(a.workers), "--base", a.base]
+                      log = open(os.path.join(logdir, "run_%s_%s.log" % (y, tag)), "w")
+                      procs.append((y, tag, subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT), log))
+              print("started %d runs (%d years x %d groups); logs in %s" % (len(procs), len(years), a.groups, logdir))
+              for g in range(a.groups):
+                  print("  group g%d: %s" % (g + 1, ",".join(groups[g])))
+              bad = 0
+              for y, tag, p, log in procs:
+                  rc = p.wait()
+                  log.close()
+                  print("run %s/%s exit code %d" % (y, tag, rc))
+                  bad += rc != 0
+              return 1 if bad else 0
+
+
+          def main():
+              ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+              sub = ap.add_subparsers(dest="cmd", required=True)
+
+              def common(p):
+                  p.add_argument("--contact", required=True, help="contact email or URL for the User-Agent (use your business address)")
+                  p.add_argument("--out", default="esef_out")
+                  p.add_argument("--workers", type=int, default=6)
+                  p.add_argument("--base", default=DEFAULT_BASE, help="override for testing")
+                  p.add_argument("--client", default="KAIM-Research-ESEF-pilot")
+
+              r = sub.add_parser("run")
+              common(r)
+              r.add_argument("--year", type=int, required=True, help="calendar year of period end")
+              r.add_argument("--countries", default="", help="comma list, default = all target countries incl. DE, IE")
+              r.add_argument("--tag", default="")
+              r.add_argument("--delay", type=float, default=0.1, help="seconds before each download")
+              r.add_argument("--api-check", dest="api_check", action="store_true", default=True)
+              r.set_defaults(func=cmd_run)
+
+              l = sub.add_parser("launch")
+              common(l)
+              l.add_argument("--first-year", type=int, default=2020)
+              l.add_argument("--last-year", type=int, default=2025)
+              l.add_argument("--groups", type=int, default=2, help="country groups per year")
+              l.set_defaults(func=cmd_launch)
+
+              a = ap.parse_args()
+              sys.exit(a.func(a))
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          cat > esef_pilot/esef_summary_v1.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          esef_summary_v1.py  -  pass/fail table from the esef_pull_v1.py output.
+
+          Usage:  python esef_summary_v1.py --dir esef_out
+
+          Writes into --dir:
+            summary_by_country.csv   the pass criteria per country
+            concept_candidates.csv   most common rd / capitalized-development candidate concepts
+            anomalies.csv            entities whose R&D jumps by >= 500x between years (scale errors)
+          and prints the country table.
+
+          Counting rules
+            * R&D facts: ifrs-full:ResearchAndDevelopmentExpense, no extra dimensions,
+              duration 350-380 days. Fiscal year = calendar year of the period end.
+            * Only entities with a filing in the pull are counted.
+          """
+
+          import argparse
+          import csv
+          import glob
+          import json
+          import os
+          from collections import Counter, defaultdict
+
+
+          def read_all(pattern):
+              rows = []
+              for p in sorted(glob.glob(pattern)):
+                  with open(p, newline="", encoding="utf-8") as fh:
+                      rows.extend(csv.DictReader(fh))
+              return rows
+
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--dir", default="esef_out")
+              a = ap.parse_args()
+
+              filings = read_all(os.path.join(a.dir, "filings_*.csv"))
+              facts = read_all(os.path.join(a.dir, "facts_*.csv"))
+              errors = read_all(os.path.join(a.dir, "errors_*.csv"))
+              if not filings:
+                  print("no filings_*.csv found in", a.dir)
+                  return
+
+              ent_country = {}
+              country_filings = Counter()
+              for f in filings:
+                  ent_country[f["entity_id"]] = f["country"]
+                  country_filings[f["country"]] += 1
+              country_entities = defaultdict(set)
+              for e, c in ent_country.items():
+                  country_entities[c].add(e)
+
+              rd_years = defaultdict(lambda: defaultdict(list))   # entity -> fy -> values
+              rd_ccy = defaultdict(Counter)                       # country -> currency counts
+              has_shares = defaultdict(set)
+              has_capdev = defaultdict(set)
+              has_rd_cand = defaultdict(set)
+              cap_concepts = Counter()
+              rd_concepts = Counter()
+              undimensioned_rd_filings = set()
+
+              for r in facts:
+                  e, c, kind = r["entity_id"], r["country"], r["kind"]
+                  if kind == "rd_expense" and not r["dims"]:
+                      try:
+                          days = int(r["days"])
+                          v = float(r["value"])
+                      except ValueError:
+                          continue
+                      if 350 <= days <= 380 and r["period_end"] and v > 0:  # zero R&D = not an R&D company
+                          rd_years[e][r["period_end"][:4]].append(v)
+                          rd_ccy[c][r["unit"]] += 1
+                          undimensioned_rd_filings.add(r["filing_id"])
+                  elif kind == "shares":
+                      has_shares[c].add(e)
+                  elif kind == "capdev_candidate":
+                      has_capdev[c].add(e)
+                      cap_concepts[r["concept"]] += 1
+                  elif kind == "rd_candidate":
+                      has_rd_cand[c].add(e)
+                      rd_concepts[r["concept"]] += 1
+
+              # anomalies
+              anomalies = []
+              for e, by_year in rd_years.items():
+                  vals = [max(v) for v in by_year.values() if max(v) > 0]
+                  if len(vals) >= 2 and max(vals) / min(vals) >= 500:
+                      anomalies.append((ent_country.get(e, ""), e, min(vals), max(vals), max(vals) / min(vals)))
+
+              out = []
+              for c in sorted(country_filings):
+                  ents = country_entities[c]
+                  with_rd = [e for e in ents if e in rd_years]
+                  with_3 = [e for e in with_rd if len(rd_years[e]) >= 3]
+                  n_ent = len(ents)
+                  cap_n = len([e for e in with_rd if e in has_capdev[c]])
+                  sh_n = len([e for e in with_rd if e in has_shares[c]])
+                  cand_n = len([e for e in ents if e not in rd_years and e in has_rd_cand[c]])
+                  out.append({
+                      "country": c,
+                      "filings": country_filings[c],
+                      "companies": n_ent,
+                      "with_rd_expense": len(with_rd),
+                      "with_rd_3plus_years": len(with_3),
+                      "pct_rd_with_capdev_fact": round(100 * cap_n / len(with_rd), 1) if with_rd else "",
+                      "pct_rd_with_shares": round(100 * sh_n / len(with_rd), 1) if with_rd else "",
+                      "no_std_rd_but_other_rd_tag": cand_n,
+                      "currencies": ";".join("%s:%d" % kv for kv in rd_ccy[c].most_common(3)),
+                      "anomaly_companies": sum(1 for x in anomalies if x[0] == c),
+                  })
+
+              path = os.path.join(a.dir, "summary_by_country.csv")
+              with open(path, "w", newline="") as fh:
+                  w = csv.DictWriter(fh, fieldnames=list(out[0].keys()))
+                  w.writeheader()
+                  w.writerows(out)
+              with open(os.path.join(a.dir, "concept_candidates.csv"), "w", newline="") as fh:
+                  w = csv.writer(fh)
+                  w.writerow(["group", "concept", "fact_count"])
+                  for k, n in cap_concepts.most_common(60):
+                      w.writerow(["capdev_candidate", k, n])
+                  for k, n in rd_concepts.most_common(60):
+                      w.writerow(["rd_candidate", k, n])
+              with open(os.path.join(a.dir, "anomalies.csv"), "w", newline="") as fh:
+                  w = csv.writer(fh)
+                  w.writerow(["country", "entity_id", "min_rd", "max_rd", "ratio"])
+                  w.writerows(anomalies)
+
+              hdr = ["country", "filings", "companies", "with_rd_expense", "with_rd_3plus_years",
+                     "pct_rd_with_capdev_fact", "pct_rd_with_shares", "anomaly_companies"]
+              print("  ".join("%-12s" % h[:12] for h in hdr))
+              for r in out:
+                  print("  ".join("%-12s" % str(r[h])[:12] for h in hdr))
+              print("\nerrors logged: %d filings failed to download or parse" % len(errors))
+              print("wrote", path)
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          cat > esef_pilot/sec_germany_scan_v1.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          sec_germany_scan_v1.py  -  which German companies file with the SEC, and which of
+          the DAX/MDAX/SDAX names are among them.
+
+          Standard library only. One run takes roughly 20-30 minutes because SEC allows
+          about 10 requests/second; this script stays at --rate (default 6/s).
+
+          Usage:
+            python sec_germany_scan_v1.py --contact info@example.com --out sec_scan_out
+
+          Steps
+            1. Download SEC's list of exchange-listed filers (company_tickers_exchange.json).
+            2. Fuzzy-match every name against german_index_names_v1.txt  -> name_matches.csv
+               (catches companies like Qiagen whose business address is not in Germany).
+            3. For each filer, read data.sec.gov/submissions and keep those whose business or
+               mailing address is Germany (EDGAR code 2M)  -> german_address_filers.csv
+            4. Print the top state/country codes seen so you can confirm 2M really is Germany.
+
+          Use your own business contact in --contact (SEC requires a contact in the User-Agent).
+          """
+
+          import argparse
+          import csv
+          import difflib
+          import json
+          import os
+          import re
+          import sys
+          import threading
+          import time
+          from collections import Counter
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError, URLError
+
+          STOP = {"ag", "se", "nv", "sa", "kgaa", "co", "holding", "holdings", "group", "inc", "plc",
+                  "ltd", "corp", "corporation", "limited", "adr", "ads", "the", "de", "ord", "sponsored",
+                  "und", "kg", "gmbh", "spa", "oyj", "ab", "asa"}
+
+
+          def norm(s):
+              s = s.lower().replace("&", " and ")
+              s = re.sub(r"[^a-z0-9 ]+", " ", s)
+              toks = [t for t in s.split() if t not in STOP]
+              return " ".join(toks)
+
+
+          class Limiter:
+              def __init__(self, rate):
+                  self.interval = 1.0 / rate
+                  self.lock = threading.Lock()
+                  self.next = 0.0
+
+              def wait(self):
+                  with self.lock:
+                      now = time.time()
+                      if self.next > now:
+                          time.sleep(self.next - now)
+                          now = self.next
+                      self.next = now + self.interval
+
+
+          def get(url, ua, lim, retries=5):
+              delay = 1.0
+              for _ in range(retries):
+                  lim.wait()
+                  try:
+                      req = Request(url, headers={"User-Agent": ua, "Accept-Encoding": "identity"})
+                      with urlopen(req, timeout=60) as r:
+                          return json.loads(r.read())
+                  except HTTPError as e:
+                      if e.code in (429, 500, 502, 503, 504):
+                          time.sleep(delay)
+                          delay *= 2
+                          continue
+                      raise
+                  except (URLError, TimeoutError, ConnectionError):
+                      time.sleep(delay)
+                      delay *= 2
+              raise RuntimeError("failed: " + url)
+
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--contact", required=True)
+              ap.add_argument("--out", default="sec_scan_out")
+              ap.add_argument("--names", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "german_index_names_v1.txt"))
+              ap.add_argument("--rate", type=float, default=6.0)
+              ap.add_argument("--codes", default="2M", help="EDGAR state/country codes to keep (Germany = 2M)")
+              ap.add_argument("--limit", type=int, default=0, help="only scan the first N filers (testing)")
+              ap.add_argument("--tickers-url", default="https://www.sec.gov/files/company_tickers_exchange.json")
+              ap.add_argument("--submissions-base", default="https://data.sec.gov/submissions")
+              a = ap.parse_args()
+
+              ua = "KAIM-Research-SEC-scan %s" % a.contact
+              os.makedirs(a.out, exist_ok=True)
+              lim = Limiter(a.rate)
+              codes = {c.strip().upper() for c in a.codes.split(",")}
+
+              names = [l.strip() for l in open(a.names, encoding="utf-8") if l.strip() and not l.startswith("#")]
+              normed = {n: norm(n) for n in names}
+
+              t = get(a.tickers_url, ua, lim)
+              fields = t["fields"]
+              ix = {k: fields.index(k) for k in fields}
+              filers = {}
+              for row in t["data"]:
+                  cik = int(row[ix["cik"]])
+                  filers.setdefault(cik, {"name": row[ix["name"]], "tickers": [], "exchange": row[ix.get("exchange", 0)] if "exchange" in ix else ""})
+                  filers[cik]["tickers"].append(row[ix["ticker"]])
+              print("listed SEC filers:", len(filers))
+
+              # step 2: name matches
+              with open(os.path.join(a.out, "name_matches.csv"), "w", newline="", encoding="utf-8") as fh:
+                  w = csv.writer(fh)
+                  w.writerow(["index_name", "sec_name", "cik", "tickers", "exchange", "reason", "score"])
+                  for cik, f in filers.items():
+                      fn = norm(f["name"])
+                      if not fn:
+                          continue
+                      for n, nn in normed.items():
+                          if not nn:
+                              continue
+                          if fn == nn:
+                              reason, score = "exact", 1.0
+                          elif (fn.startswith(nn + " ") or nn.startswith(fn + " ")) and min(len(fn), len(nn)) >= 5:
+                              reason, score = "prefix", 0.9
+                          else:
+                              sc = difflib.SequenceMatcher(None, fn, nn).ratio()
+                              if sc < 0.9:
+                                  continue
+                              reason, score = "fuzzy", round(sc, 2)
+                          w.writerow([n, f["name"], cik, ";".join(f["tickers"]), f["exchange"], reason, score])
+              print("wrote name_matches.csv (review by eye: 'prefix' matches can be false positives)")
+
+              # step 3: submissions scan
+              items = list(filers.items())
+              if a.limit:
+                  items = items[: a.limit]
+              seen_codes = Counter()
+              found = []
+              lock = threading.Lock()
+
+              def scan(cik, f):
+                  d = get("%s/CIK%010d.json" % (a.submissions_base, cik), ua, lim)
+                  addr = d.get("addresses") or {}
+                  bus = ((addr.get("business") or {}).get("stateOrCountry") or "").upper()
+                  mail = ((addr.get("mailing") or {}).get("stateOrCountry") or "").upper()
+                  forms = sorted(set((d.get("filings") or {}).get("recent", {}).get("form", [])))
+                  keep = [x for x in ("20-F", "20-F/A", "10-K", "40-F", "6-K", "10-Q", "F-1", "S-1") if x in forms]
+                  return cik, f, bus, mail, d, keep
+
+              with ThreadPoolExecutor(max_workers=4) as ex:
+                  futs = [ex.submit(scan, cik, f) for cik, f in items]
+                  for i, fut in enumerate(as_completed(futs), 1):
+                      try:
+                          cik, f, bus, mail, d, forms = fut.result()
+                      except Exception as e:  # noqa
+                          print("error:", e, file=sys.stderr)
+                          continue
+                      with lock:
+                          seen_codes[bus] += 1
+                          if bus in codes or mail in codes:
+                              found.append([cik, d.get("name"), ";".join(f["tickers"]), f["exchange"], bus, mail,
+                                            d.get("stateOfIncorporation", ""), d.get("sic", ""),
+                                            d.get("sicDescription", ""), ";".join(forms)])
+                      if i % 500 == 0:
+                          print("scanned %d/%d, German-address filers so far: %d" % (i, len(items), len(found)))
+
+              with open(os.path.join(a.out, "german_address_filers.csv"), "w", newline="", encoding="utf-8") as fh:
+                  w = csv.writer(fh)
+                  w.writerow(["cik", "name", "tickers", "exchange", "business_code", "mailing_code",
+                              "state_of_incorporation", "sic", "sic_description", "forms_seen_recent"])
+                  w.writerows(sorted(found, key=lambda r: r[1] or ""))
+              print("German-address filers:", len(found))
+              print("most common business codes (confirm 2M is Germany):", seen_codes.most_common(12))
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          cat > esef_pilot/german_index_names_v1.txt <<'PYEOF'
+          # DAX / MDAX / SDAX constituent names, one per line (lines starting with # are ignored).
+          # Source: Wikipedia component tables fetched Nov 2026. The MDAX table reflects the
+          # January 2023 review and the SDAX table had 68 of 70 names, so refresh before relying on it.
+          # DAX
+          Adidas
+          Airbus
+          Allianz
+          BASF
+          Bayer
+          Beiersdorf
+          BMW
+          Brenntag
+          Commerzbank
+          Continental
+          Daimler Truck
+          Deutsche Bank
+          Deutsche Boerse
+          Deutsche Post
+          Deutsche Telekom
+          E.ON
+          Fresenius
+          Fresenius Medical Care
+          GEA Group
+          Hannover Re
+          Heidelberg Materials
+          Henkel
+          Infineon Technologies
+          Mercedes-Benz Group
+          Merck
+          MTU Aero Engines
+          Munich Re
+          Porsche SE
+          Qiagen
+          Rheinmetall
+          RWE
+          SAP
+          Scout24
+          Siemens
+          Siemens Energy
+          Siemens Healthineers
+          Symrise
+          Volkswagen
+          Vonovia
+          Zalando
+          # MDAX
+          Aixtron
+          Aroundtown
+          Aurubis
+          Bechtle
+          Befesa
+          Bilfinger
+          Carl Zeiss Meditec
+          CTS Eventim
+          Delivery Hero
+          Lufthansa
+          Encavis
+          Evonik
+          Evotec
+          Fraport
+          Freenet
+          Fuchs Petrolub
+          Gerresheimer
+          Hella
+          HelloFresh
+          Hensoldt
+          Hochtief
+          Hugo Boss
+          Jenoptik
+          Jungheinrich
+          K+S
+          KION Group
+          Knorr-Bremse
+          Krones
+          Lanxess
+          LEG Immobilien
+          Nemetschek
+          Nordex
+          Suss Microtec
+          Puma
+          Rational
+          Redcare Pharmacy
+          RTL Group
+          Siltronic
+          Stabilus
+          Stroer
+          TAG Immobilien
+          Talanx
+          TeamViewer
+          ThyssenKrupp
+          Traton
+          TUI
+          United Internet
+          Wacker Chemie
+          # SDAX
+          1&1
+          Adesso
+          Adtran Networks
+          Alzchem
+          Amadeus Fire
+          Atoss Software
+          Borussia Dortmund
+          Cancom
+          Cewe
+          Dermapharm
+          Deutsche Beteiligungs
+          Deutsche Euroshop
+          Deutz
+          Douglas
+          Draegerwerk
+          Duerr
+          Eckert & Ziegler
+          Elmos Semiconductor
+          Energiekontor
+          Formycon
+          GFT Technologies
+          Grand City Properties
+          Grenke
+          Hamborner Reit
+          Heidelberger Druckmaschinen
+          Hornbach Holding
+          Hypoport
+          Indus Holding
+          Jost Werke
+          Kloeckner & Co
+          Kontron
+          KSB
+          KWS Saat
+          LPKF Laser
+          MBB
+          Medios
+          MLP
+          Mutares
+          Nagarro
+          Norma Group
+          Patrizia
+          PBB
+          PNE
+          ProCredit
+          ProSiebenSat.1
+          PVA TePla
+          SAF-Holland
+          Salzgitter
+          Schaeffler
+          Schott Pharma
+          Secunet
+          SFC Energy
+          SMA Solar
+          Sixt
+          Springer Nature
+          Sto
+          Stratec
+          Suedzucker
+          Thyssenkrupp Nucera
+          Verve Group
+          Vossloh
+          Wacker Neuson
+          Wuestenrot & Wuerttembergische
+          PYEOF
+          ls -l esef_pilot
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scripts
+          path: esef_pilot/
+
+  pull:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        year: [2020, 2021, 2022, 2023, 2024, 2025]
+        group: [g1, g2]
+        include:
+          - group: g1
+            countries: "FR,DE,ES,SE,FI,NO,AT,PT,LU,HU,HR,SK"
+          - group: g2
+            countries: "GB,IT,NL,DK,PL,BE,IE,GR,CZ,RO,LT,IS"
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: scripts
+          path: esef_pilot
+      - name: Pull ${{ matrix.year }} / ${{ matrix.group }}
+        env:
+          CONTACT: ${{ inputs.contact || secrets.ESEF_CONTACT }}
+        run: |
+          python esef_pilot/esef_pull_v1.py run \
+            --year ${{ matrix.year }} \
+            --countries "${{ matrix.countries }}" \
+            --tag ${{ matrix.group }} \
+            --contact "$CONTACT" \
+            --out out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: esef-${{ matrix.year }}-${{ matrix.group }}
+          path: out/
+          if-no-files-found: ignore
+
+  summary:
+    needs: pull
+    if: ${{ !cancelled() && needs.pull.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: scripts
+          path: esef_pilot
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: esef-*
+          merge-multiple: true
+          path: out
+      - name: Summarize
+        run: |
+          mkdir -p out
+          python esef_pilot/esef_summary_v1.py --dir out | tee out/summary_printout.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: esef-summary
+          path: |
+            out/summary_by_country.csv
+            out/concept_candidates.csv
+            out/anomalies.csv
+            out/summary_printout.txt
+            out/country_counts_*.csv
+
+  sec_scan:
+    needs: setup
+    if: ${{ inputs.run_sec_scan }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: scripts
+          path: esef_pilot
+      - name: Scan SEC for German filers
+        env:
+          CONTACT: ${{ inputs.contact || secrets.ESEF_CONTACT }}
+        run: |
+          python esef_pilot/sec_germany_scan_v1.py \
+            --contact "$CONTACT" \
+            --names esef_pilot/german_index_names_v1.txt \
+            --out sec_scan_out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sec-germany-scan
+          path: sec_scan_out/
+          if-no-files-found: ignore
 
