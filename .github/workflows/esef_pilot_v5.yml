@@ -1,1 +1,533 @@
+# esef_pilot_v5.yml  -  ONE-FILE workflow. v5 = pull script v3: adds revenue, net income,
+# total assets, total equity, EPS and cash, and saves every raw filing (gzipped).
+# Save it in your repo as:  .github/workflows/esef_pilot_v5.yml
+# Then: Actions tab > "ESEF pilot v5" > Run workflow > type your business email in the
+# contact box > Run workflow. No other files are needed.
+#
+# 24 small pull jobs (6 period-end years x 4 country groups) start at the same time.
+# Each job uploads two artifacts: "esef-YEAR-GROUP" (the CSVs, the ones that matter most)
+# and "raw-YEAR-GROUP" (the raw xBRL-JSON files). Raw files are kept 14 days.
+# If free-plan artifact storage fills up, rerun with "save_raw" turned off.
+
+name: ESEF pilot v5
+
+on:
+  workflow_dispatch:
+    inputs:
+      contact:
+        description: "Contact email for the User-Agent (use your business address)"
+        required: false
+        default: ""
+      save_raw:
+        description: "Also save the raw filing files (large)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check contact
+        env:
+          CONTACT: ${{ inputs.contact || secrets.ESEF_CONTACT }}
+        run: |
+          if [ -z "$CONTACT" ]; then echo "Type your business email in the contact box when you tap Run workflow"; exit 1; fi
+      - name: Write script
+        run: |
+          mkdir -p esef_pilot
+          cat > esef_pilot/esef_pull_v3.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          esef_pull_v2.py  -  pilot pull of ESEF/UKSEF facts from filings.xbrl.org
+
+          Two subcommands:
+
+            run     One small run: one calendar year of period-end dates, optionally a
+                    subset of countries. Writes CSVs into --out.
+            launch  Starts many `run` processes at the same time (years x country groups)
+                    so the whole pull finishes in well under an hour.
+
+          Standard library only (no pip installs needed). Python 3.9+.
+
+          Examples
+            python esef_pull_v2.py launch --contact info@example.com --out esef_out
+            python esef_pull_v2.py run --year 2023 --countries DE,IE --contact info@example.com --out esef_out
+
+          Use your own business contact in --contact. filings.xbrl.org asks regular
+          users to put contact details in the User-Agent.
+
+          What it extracts from each filing's xBRL-JSON (kind column):
+            rd_expense       ifrs-full:ResearchAndDevelopmentExpense
+            shares           ifrs-full:NumberOfSharesOutstanding / NumberOfSharesIssued
+            capdev_cashflow  ifrs-full:PaymentsForDevelopmentProjectExpenditure (v2)
+            shares_wavg      ifrs-full:WeightedAverageShares (v2, fallback share count)
+            rd_candidate     other concepts about research or capitalized development
+            capdev_candidate "Additions" concepts about intangibles where the concept or a
+                             dimension member mentions internally generated / development
+          The candidates exist so you can see which elements companies really use for
+          capitalized development; esef_summary_v1.py ranks them.
+          """
+
+          import argparse
+          import csv
+          import gzip
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import threading
+          import time
+          from collections import Counter
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from datetime import date, timedelta
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
+          from urllib.request import Request, urlopen
+
+          DEFAULT_BASE = "https://filings.xbrl.org"
+
+          # Ordered roughly by expected filing volume so round-robin splitting balances runs.
+          TARGET = ["FR", "GB", "DE", "IT", "ES", "NL", "SE", "DK", "FI", "PL", "NO", "BE",
+                    "AT", "IE", "PT", "GR", "LU", "CZ", "HU", "RO", "HR", "LT", "SK", "IS"]
+
+          EXACT = {
+              "ifrs-full:ResearchAndDevelopmentExpense": "rd_expense",
+              "ifrs-full:NumberOfSharesOutstanding": "shares",
+              "ifrs-full:NumberOfSharesIssued": "shares",
+              # v2: capitalized development spend as a cash outflow (on the face of the cash flow
+              # statement, so it is tagged even in early ESEF years) and weighted-average shares
+              # as a fallback share count.
+              "ifrs-full:PaymentsForDevelopmentProjectExpenditure": "capdev_cashflow",
+              "ifrs-full:WeightedAverageShares": "shares_wavg",
+              "ifrs-full:AdjustedWeightedAverageShares": "shares_wavg",
+              # v3: financial statement elements (undimensioned and dimensioned facts both kept;
+              # filter on the dims column downstream)
+              "ifrs-full:Revenue": "revenue",
+              "ifrs-full:RevenueFromContractsWithCustomers": "revenue_contracts",
+              "ifrs-full:RevenueFromSaleOfGoods": "revenue_goods",
+              "ifrs-full:RevenueFromRenderingOfServices": "revenue_services",
+              "ifrs-full:ProfitLoss": "net_income",
+              "ifrs-full:ProfitLossAttributableToOwnersOfParent": "net_income_parent",
+              "ifrs-full:Equity": "total_equity",
+              "ifrs-full:Assets": "total_assets",
+              "ifrs-full:BasicEarningsLossPerShare": "eps_basic",
+              "ifrs-full:DilutedEarningsLossPerShare": "eps_diluted",
+              "ifrs-full:CashAndCashEquivalents": "cash",
+          }
+          # v2: tighter than v1 (v1 matched any "development", e.g. property development)
+          RD_PAT = re.compile(r"research|capitali[sz]eddevelopment|developmentexpense|developmentcost|developmentexpenditure", re.I)
+          ADD_PAT = re.compile(r"additions", re.I)
+          INTANG_PAT = re.compile(r"intangible", re.I)
+          DIM_PAT = re.compile(r"internallygenerated|development", re.I)
+          CORE_DIMS = {"concept", "entity", "period", "unit", "language"}
+
+          FACT_FIELDS = ["filing_id", "country", "entity_id", "entity_name", "kind", "concept",
+                         "value", "unit", "decimals", "period_start", "period_end", "days", "dims"]
+          FILING_FIELDS = ["filing_id", "country", "entity_id", "entity_name", "period_end",
+                           "processed", "json_url", "n_facts"]
+
+
+          # ----------------------------------------------------------------------------
+          # HTTP
+          # ----------------------------------------------------------------------------
+          def http_get(url, ua, retries=5, timeout=90):
+              delay = 1.0
+              last = None
+              for _ in range(retries):
+                  try:
+                      req = Request(url, headers={"User-Agent": ua, "Accept-Encoding": "gzip"})
+                      with urlopen(req, timeout=timeout) as r:
+                          data = r.read()
+                          if r.headers.get("Content-Encoding") == "gzip":
+                              data = gzip.decompress(data)
+                          return data
+                  except HTTPError as e:
+                      if e.code in (429, 500, 502, 503, 504):
+                          last = e
+                          time.sleep(delay)
+                          delay *= 2
+                          continue
+                      raise
+                  except (URLError, TimeoutError, ConnectionError) as e:
+                      last = e
+                      time.sleep(delay)
+                      delay *= 2
+              raise RuntimeError("failed after %d tries: %s (%s)" % (retries, url, last))
+
+
+          # ----------------------------------------------------------------------------
+          # Index
+          # ----------------------------------------------------------------------------
+          def first(d, *keys):
+              for k in keys:
+                  v = d.get(k)
+                  if v not in (None, ""):
+                      return v
+              return None
+
+
+          def load_index(year, base, ua):
+              raw = http_get("%s/indexes/filings-%s.json" % (base, year), ua)
+              doc = json.loads(raw)
+              ents = {}
+              for inc in doc.get("included", []) or []:
+                  if inc.get("type") == "entity":
+                      ents[inc.get("id")] = inc.get("attributes", {}) or {}
+              rows = []
+              for d in doc.get("data", []) or []:
+                  a = d.get("attributes", {}) or {}
+                  rel = ((d.get("relationships") or {}).get("entity") or {}).get("data") or {}
+                  eid = rel.get("id")
+                  e = ents.get(eid, {})
+                  rows.append({
+                      "filing_id": d.get("id"),
+                      "country": (first(a, "country") or "").upper(),
+                      "entity_id": first(e, "identifier") or eid,
+                      "entity_name": first(e, "name") or "",
+                      "period_end": first(a, "period_end", "last_end_date"),
+                      "processed": first(a, "processed", "processed_time", "published", "added_time") or "",
+                      "json_url": first(a, "json_url"),
+                  })
+              if rows:
+                  print("index sample keys (first filing attributes): %s"
+                        % sorted((doc["data"][0].get("attributes") or {}).keys()), file=sys.stderr)
+              return rows
+
+
+          def api_count(country, base, ua):
+              url = "%s/api/filings?filter[country]=%s&page[size]=1" % (base, country)
+              doc = json.loads(http_get(quote(url, safe=":/?[]=&"), ua, retries=2))
+              meta = doc.get("meta") or {}
+              cnt = first(meta, "count", "total", "total_count")
+              return cnt if cnt is not None else len(doc.get("data", []))
+
+
+          def dedupe(rows):
+              """Keep the latest-processed filing per (entity, period_end)."""
+              best = {}
+              for r in rows:
+                  k = (r["entity_id"], r["period_end"])
+                  if k not in best or (r["processed"] or "") > (best[k]["processed"] or ""):
+                      best[k] = r
+              return list(best.values())
+
+
+          # ----------------------------------------------------------------------------
+          # Facts
+          # ----------------------------------------------------------------------------
+          def parse_period(p):
+              """xBRL-JSON period: instant 'YYYY-MM-DD..' or duration 'start/end' (end exclusive)."""
+              if not p:
+                  return None, None, None
+              try:
+                  if "/" in p:
+                      s, e = p.split("/", 1)
+                      sd = date.fromisoformat(s[:10])
+                      ed = date.fromisoformat(e[:10])
+                      if e[10:].startswith("T00:00") or len(e) == 10:
+                          ed = ed - timedelta(days=1)  # exclusive end -> last day of period
+                      return sd.isoformat(), ed.isoformat(), (ed - sd).days + 1
+                  d = date.fromisoformat(p[:10])
+                  return "", d.isoformat(), 0
+              except ValueError:
+                  return None, None, None
+
+
+          def classify(concept, dims):
+              if concept in EXACT:
+                  return EXACT[concept]
+              local = concept.split(":", 1)[-1]
+              if ADD_PAT.search(local) and INTANG_PAT.search(local):
+                  if DIM_PAT.search(local) or any(DIM_PAT.search(str(v)) for v in dims.values()):
+                      return "capdev_candidate"
+              if RD_PAT.search(local):
+                  return "rd_candidate"
+              return None
+
+
+          def parse_facts(doc, f):
+              facts = doc.get("facts", {})
+              it = facts.values() if isinstance(facts, dict) else facts
+              out = []
+              for fact in it:
+                  dimsfull = fact.get("dimensions") or {}
+                  concept = dimsfull.get("concept")
+                  if not concept:
+                      continue
+                  extra = {k: v for k, v in dimsfull.items() if k not in CORE_DIMS}
+                  kind = classify(concept, extra)
+                  if not kind:
+                      continue
+                  val = fact.get("value")
+                  try:
+                      float(val)
+                  except (TypeError, ValueError):
+                      continue
+                  ps, pe, days = parse_period(dimsfull.get("period"))
+                  out.append({
+                      "filing_id": f["filing_id"], "country": f["country"],
+                      "entity_id": f["entity_id"], "entity_name": f["entity_name"],
+                      "kind": kind, "concept": concept, "value": val,
+                      "unit": dimsfull.get("unit", ""), "decimals": fact.get("decimals", ""),
+                      "period_start": ps, "period_end": pe, "days": days,
+                      "dims": json.dumps(extra, sort_keys=True) if extra else "",
+                  })
+              return out
+
+
+          def clean_url(url):
+              """v1 failed on filing URLs containing spaces or non-ASCII characters; percent-encode the path."""
+              p = urlsplit(url)
+              return urlunsplit((p.scheme, p.netloc, quote(unquote(p.path), safe="/:@"), p.query, p.fragment))
+
+
+          def process_filing(f, base, ua, raw_dir=None):
+              url = clean_url(urljoin(base + "/", f["json_url"]))
+              body = http_get(url, ua, timeout=180)
+              if raw_dir:
+                  import gzip
+                  os.makedirs(raw_dir, exist_ok=True)
+                  name = re.sub(r"[^A-Za-z0-9._-]+", "_", "%s_%s_%s" % (f["country"], f["entity_id"], f["filing_id"]))[:180]
+                  with gzip.open(os.path.join(raw_dir, name + ".json.gz"), "wb", compresslevel=9) as gz:
+                      gz.write(body if isinstance(body, bytes) else body.encode("utf-8"))
+              doc = json.loads(body)
+              return parse_facts(doc, f)
+
+
+          # ----------------------------------------------------------------------------
+          # run
+          # ----------------------------------------------------------------------------
+          def cmd_run(a):
+              ua = "%s %s" % (a.client, a.contact)
+              os.makedirs(a.out, exist_ok=True)
+              tag = a.tag or "all"
+              countries = [c.strip().upper() for c in a.countries.split(",")] if a.countries else TARGET
+              base = a.base.rstrip("/")
+
+              try:
+                  rows = load_index(a.year, base, ua)
+              except HTTPError as e:
+                  if e.code == 404:
+                      print("[%s/%s] no index for year %s (404)" % (a.year, tag, a.year))
+                      return 0
+                  raise
+
+              counts = Counter(r["country"] for r in rows)
+              with open(os.path.join(a.out, "country_counts_%s_%s.csv" % (a.year, tag)), "w", newline="") as fh:
+                  w = csv.writer(fh)
+                  w.writerow(["country", "filings_in_index"])
+                  for c, n in sorted(counts.items()):
+                      w.writerow([c, n])
+              print("[%s/%s] index: %d filings, %d countries" % (a.year, tag, len(rows), len(counts)))
+              for c in countries:
+                  n = counts.get(c, 0)
+                  line = "[%s/%s]   %s: %d in index" % (a.year, tag, c, n)
+                  if n == 0 and a.api_check and c in ("DE", "IE"):
+                      try:
+                          line += "  | API check (all years): %s" % api_count(c, base, ua)
+                      except Exception as e:  # noqa
+                          line += "  | API check failed: %s" % e
+                  print(line)
+
+              sel = dedupe([r for r in rows if r["country"] in countries])
+              nojson = [r for r in sel if not r["json_url"]]
+              sel = [r for r in sel if r["json_url"]]
+              print("[%s/%s] selected %d filings after de-dup (%d without json_url skipped)"
+                    % (a.year, tag, len(sel), len(nojson)))
+
+              facts_path = os.path.join(a.out, "facts_%s_%s.csv" % (a.year, tag))
+              filings_path = os.path.join(a.out, "filings_%s_%s.csv" % (a.year, tag))
+              errors_path = os.path.join(a.out, "errors_%s_%s.csv" % (a.year, tag))
+              done_path = os.path.join(a.out, "done_%s_%s.txt" % (a.year, tag))
+
+              done = set()
+              if os.path.exists(done_path):
+                  with open(done_path) as fh:
+                      done = {l.strip() for l in fh if l.strip()}
+              todo = [r for r in sel if r["filing_id"] not in done]
+              print("[%s/%s] %d already done, %d to fetch" % (a.year, tag, len(done), len(todo)))
+
+              def open_csv(path, fields):
+                  new = not os.path.exists(path)
+                  fh = open(path, "a", newline="", encoding="utf-8")
+                  w = csv.DictWriter(fh, fieldnames=fields)
+                  if new:
+                      w.writeheader()
+                  return fh, w
+
+              ffh, fw = open_csv(facts_path, FACT_FIELDS)
+              gfh, gw = open_csv(filings_path, FILING_FIELDS)
+              efh, ew = open_csv(errors_path, ["filing_id", "country", "entity_name", "json_url", "error"])
+              dfh = open(done_path, "a")
+              lock = threading.Lock()
+              t0 = time.time()
+              ok = bad = 0
+
+              raw_dir = os.path.join(a.raw_out, "raw_%s_%s" % (a.year, tag)) if a.save_raw else None
+
+              def work(r):
+                  time.sleep(a.delay)
+                  return r, process_filing(r, base, ua, raw_dir)
+
+              with ThreadPoolExecutor(max_workers=a.workers) as ex:
+                  futs = {ex.submit(work, r): r for r in todo}
+                  for i, fut in enumerate(as_completed(futs), 1):
+                      r = futs[fut]
+                      try:
+                          _, facts = fut.result()
+                          with lock:
+                              fw.writerows(facts)
+                              gw.writerow({**{k: r.get(k) for k in FILING_FIELDS if k != "n_facts"},
+                                           "n_facts": len(facts)})
+                              dfh.write(r["filing_id"] + "\n")
+                              for fh_ in (ffh, gfh, dfh):
+                                  fh_.flush()
+                          ok += 1
+                      except Exception as e:  # noqa
+                          with lock:
+                              ew.writerow({"filing_id": r["filing_id"], "country": r["country"],
+                                           "entity_name": r["entity_name"], "json_url": r["json_url"],
+                                           "error": str(e)[:300]})
+                              efh.flush()
+                          bad += 1
+                      if i % 100 == 0:
+                          print("[%s/%s] %d/%d done (%d errors) %.0fs"
+                                % (a.year, tag, i, len(todo), bad, time.time() - t0))
+              for fh_ in (ffh, gfh, efh, dfh):
+                  fh_.close()
+              print("[%s/%s] finished: %d ok, %d errors, %.0fs" % (a.year, tag, ok, bad, time.time() - t0))
+              return 0
+
+
+          # ----------------------------------------------------------------------------
+          # launch
+          # ----------------------------------------------------------------------------
+          def cmd_launch(a):
+              years = list(range(a.first_year, a.last_year + 1))
+              groups = [[] for _ in range(a.groups)]
+              for i, c in enumerate(TARGET):
+                  groups[i % a.groups].append(c)
+              os.makedirs(a.out, exist_ok=True)
+              logdir = os.path.join(a.out, "logs")
+              os.makedirs(logdir, exist_ok=True)
+              procs = []
+              for y in years:
+                  for gi, g in enumerate(groups):
+                      tag = "g%d" % (gi + 1)
+                      cmd = [sys.executable, os.path.abspath(__file__), "run", "--year", str(y),
+                             "--countries", ",".join(g), "--tag", tag, "--contact", a.contact,
+                             "--out", a.out, "--workers", str(a.workers), "--base", a.base]
+                      log = open(os.path.join(logdir, "run_%s_%s.log" % (y, tag)), "w")
+                      procs.append((y, tag, subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT), log))
+              print("started %d runs (%d years x %d groups); logs in %s" % (len(procs), len(years), a.groups, logdir))
+              for g in range(a.groups):
+                  print("  group g%d: %s" % (g + 1, ",".join(groups[g])))
+              bad = 0
+              for y, tag, p, log in procs:
+                  rc = p.wait()
+                  log.close()
+                  print("run %s/%s exit code %d" % (y, tag, rc))
+                  bad += rc != 0
+              return 1 if bad else 0
+
+
+          def main():
+              ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+              sub = ap.add_subparsers(dest="cmd", required=True)
+
+              def common(p):
+                  p.add_argument("--contact", required=True, help="contact email or URL for the User-Agent (use your business address)")
+                  p.add_argument("--out", default="esef_out")
+                  p.add_argument("--workers", type=int, default=6)
+                  p.add_argument("--base", default=DEFAULT_BASE, help="override for testing")
+                  p.add_argument("--client", default="KAIM-Research-ESEF-pilot")
+
+              r = sub.add_parser("run")
+              common(r)
+              r.add_argument("--year", type=int, required=True, help="calendar year of period end")
+              r.add_argument("--countries", default="", help="comma list, default = all target countries incl. DE, IE")
+              r.add_argument("--tag", default="")
+              r.add_argument("--save-raw", dest="save_raw", action="store_true", help="also save each raw xBRL-JSON as .json.gz")
+              r.add_argument("--raw-out", dest="raw_out", default="raw_out")
+              r.add_argument("--delay", type=float, default=0.1, help="seconds before each download")
+              r.add_argument("--api-check", dest="api_check", action="store_true", default=True)
+              r.set_defaults(func=cmd_run)
+
+              l = sub.add_parser("launch")
+              common(l)
+              l.add_argument("--first-year", type=int, default=2020)
+              l.add_argument("--last-year", type=int, default=2025)
+              l.add_argument("--groups", type=int, default=2, help="country groups per year")
+              l.set_defaults(func=cmd_launch)
+
+              a = ap.parse_args()
+              sys.exit(a.func(a))
+
+
+          if __name__ == "__main__":
+              main()
+
+          PYEOF
+          python3 -m py_compile esef_pilot/esef_pull_v3.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scripts
+          path: esef_pilot/esef_pull_v3.py
+
+  pull:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        year: [2020, 2021, 2022, 2023, 2024, 2025]
+        group: [g1, g2, g3, g4]
+        include:
+          - group: g1
+            countries: "FR,NO,AT,HU,HR,SK"
+          - group: g2
+            countries: "GB,ES,FI,PT,LU"
+          - group: g3
+            countries: "SE,IT,BE,IE,GR,CZ"
+          - group: g4
+            countries: "NL,DK,DE,PL,RO,LT,IS"
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: scripts
+          path: esef_pilot
+      - name: Pull ${{ matrix.year }} / ${{ matrix.group }}
+        env:
+          CONTACT: ${{ inputs.contact || secrets.ESEF_CONTACT }}
+          RAWFLAG: ${{ inputs.save_raw && '--save-raw' || '' }}
+        run: |
+          python esef_pilot/esef_pull_v3.py run \
+            --year ${{ matrix.year }} \
+            --countries "${{ matrix.countries }}" \
+            --tag ${{ matrix.group }} \
+            --contact "$CONTACT" \
+            --out out --raw-out raw_out $RAWFLAG
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: esef-${{ matrix.year }}-${{ matrix.group }}
+          path: out/
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.save_raw
+        with:
+          name: raw-${{ matrix.year }}-${{ matrix.group }}
+          path: raw_out/
+          retention-days: 14
+          compression-level: 0
+          if-no-files-found: ignore
 
