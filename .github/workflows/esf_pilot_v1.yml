@@ -1,1 +1,119 @@
+# esef_pilot_v1.yml
+# Put this file in your repo at:  .github/workflows/esef_pilot_v1.yml
+# Put the four scripts in a folder named esef_pilot/ at the repo root:
+#   esef_pilot/esef_pull_v1.py
+#   esef_pilot/esef_summary_v1.py
+#   esef_pilot/sec_germany_scan_v1.py
+#   esef_pilot/german_index_names_v1.txt
+#
+# Start it from the Actions tab: choose "ESEF pilot v1", tap "Run workflow".
+# 12 pull jobs (6 period-end years x 2 country groups) start at the same time,
+# then one job combines them into the summary. The SEC Germany scan runs as its
+# own job. Results are downloadable from the run page under "Artifacts".
+
+name: ESEF pilot v1
+
+on:
+  workflow_dispatch:
+    inputs:
+      contact:
+        description: "Contact email for the User-Agent (use your business address; blank = ESEF_CONTACT secret)"
+        required: false
+        default: ""
+      run_sec_scan:
+        description: "Also run the SEC Germany scan (about 20-30 min)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        year: [2020, 2021, 2022, 2023, 2024, 2025]
+        group: [g1, g2]
+        include:
+          - group: g1
+            countries: "FR,DE,ES,SE,FI,NO,AT,PT,LU,HU,HR,SK"
+          - group: g2
+            countries: "GB,IT,NL,DK,PL,BE,IE,GR,CZ,RO,LT,IS"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Pull ${{ matrix.year }} / ${{ matrix.group }}
+        env:
+          CONTACT: ${{ inputs.contact || secrets.ESEF_CONTACT }}
+        run: |
+          if [ -z "$CONTACT" ]; then echo "Set the contact input or the ESEF_CONTACT secret"; exit 1; fi
+          python esef_pilot/esef_pull_v1.py run \
+            --year ${{ matrix.year }} \
+            --countries "${{ matrix.countries }}" \
+            --tag ${{ matrix.group }} \
+            --contact "$CONTACT" \
+            --out out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: esef-${{ matrix.year }}-${{ matrix.group }}
+          path: out/
+          if-no-files-found: ignore
+
+  summary:
+    needs: pull
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: esef-*
+          merge-multiple: true
+          path: out
+      - name: Summarize
+        run: python esef_pilot/esef_summary_v1.py --dir out | tee out/summary_printout.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: esef-summary
+          path: |
+            out/summary_by_country.csv
+            out/concept_candidates.csv
+            out/anomalies.csv
+            out/summary_printout.txt
+            out/country_counts_*.csv
+
+  sec_scan:
+    if: ${{ inputs.run_sec_scan }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Scan SEC for German filers
+        env:
+          CONTACT: ${{ inputs.contact || secrets.ESEF_CONTACT }}
+        run: |
+          if [ -z "$CONTACT" ]; then echo "Set the contact input or the ESEF_CONTACT secret"; exit 1; fi
+          python esef_pilot/sec_germany_scan_v1.py \
+            --contact "$CONTACT" \
+            --names esef_pilot/german_index_names_v1.txt \
+            --out sec_scan_out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sec-germany-scan
+          path: sec_scan_out/
+          if-no-files-found: ignore
 
