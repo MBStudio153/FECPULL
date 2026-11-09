@@ -1,1 +1,310 @@
+# cpi_pull_v2.yml - ONE-FILE workflow: annual CPI index levels for the ESEF pilot countries.
+# Save it in your repo as:  .github/workflows/cpi_pull_v2.yml
+# Then: Actions tab > "CPI pull v2" > Run workflow. No inputs and no other files needed.
+#
+# v2 adds a deflator step: country-specific CPI rebased so amounts can be expressed in 2025 money
+# (cpi_deflators.csv / cpi_deflators_wide.csv / cpi_deflate_report.txt in the cpi-combined artifact).
+# Two small jobs start at the same time (Eurostat HICP, World Bank CPI) and finish in a
+# minute or two. Download "cpi-combined" (both CSVs plus request logs). Native indexes
+# only: each country is deflated by its own CPI, nothing is converted between currencies.
+
+name: CPI pull v2
+
+on:
+  workflow_dispatch:
+    inputs:
+      first_year:
+        description: "First year"
+        default: "2015"
+      last_year:
+        description: "Last year"
+        default: "2026"
+      base_year:
+        description: "Price base year (amounts expressed in this year's money)"
+        default: "2025"
+      window_first:
+        description: "First fiscal year of the index window"
+        default: "2021"
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write script
+        run: |
+          mkdir -p cpi
+          cat > cpi/cpi_pull_v2.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          cpi_pull_v2.py - annual CPI index levels for the ESEF pilot countries (native, no FX).
+
+          Standard library only. Two independent sources, run as separate small jobs:
+            --source eurostat    Eurostat HICP, annual average index (EU members, Norway, Iceland; UK if present)
+            --source worldbank   World Bank FP.CPI.TOTL consumer price index (2010 = 100), all countries incl. UK, US
+
+          Writes into --out:
+            cpi_<source>.csv     source,country,year,index,unit_or_base
+            cpi_<source>_log.txt every request tried and what came back (read this first if a file is empty)
+
+          Each country is deflated by its OWN index; nothing is converted between currencies.
+          """
+          import argparse, csv, json, os, sys, time
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urlencode
+
+          ISO3 = {"AT":"AUT","BE":"BEL","CZ":"CZE","DK":"DNK","ES":"ESP","FI":"FIN","FR":"FRA","GB":"GBR","GR":"GRC","HR":"HRV","HU":"HUN",
+                  "IS":"ISL","IT":"ITA","LT":"LTU","LU":"LUX","NL":"NLD","NO":"NOR","PL":"POL","PT":"PRT","RO":"ROU","SE":"SWE","SK":"SVK",
+                  "DE":"DEU","IE":"IRL","US":"USA"}
+          BACK3 = {v: k for k, v in ISO3.items()}
+          ES_GEO = {k: ("EL" if k == "GR" else k) for k in ISO3 if k != "US"}   # Eurostat uses EL for Greece
+          ES_BACK = {v: k for k, v in ES_GEO.items()}
+          UA = "KAIM-Research-CPI-pull (research use)"
+
+
+          def get_json(url, log, tries=4):
+              delay = 2.0
+              for i in range(tries):
+                  try:
+                      with urlopen(Request(url, headers={"User-Agent": UA, "Accept": "application/json"}), timeout=90) as r:
+                          body = r.read()
+                      log.write("OK   %s (%d bytes)\n" % (url, len(body)))
+                      return json.loads(body)
+                  except HTTPError as e:
+                      log.write("HTTP %s  %s\n" % (e.code, url))
+                      if e.code in (400, 404):
+                          return None
+                  except (URLError, TimeoutError, ConnectionError, ValueError) as e:
+                      log.write("ERR  %s  %s\n" % (e, url))
+                  time.sleep(delay); delay *= 2
+              return None
+
+
+          # ---------------- World Bank ----------------
+          def parse_worldbank(doc):
+              rows = []
+              if not doc or len(doc) < 2 or not doc[1]:
+                  return rows
+              for x in doc[1]:
+                  iso3 = x.get("countryiso3code") or ""
+                  if iso3 in BACK3 and x.get("value") is not None:
+                      rows.append(("worldbank", BACK3[iso3], int(x["date"]), x["value"], "FP.CPI.TOTL (2010=100)"))
+              return rows
+
+
+          def run_worldbank(a, log):
+              codes = ";".join(sorted(ISO3.values()))
+              rows, page = [], 1
+              while True:
+                  url = "https://api.worldbank.org/v2/country/%s/indicator/FP.CPI.TOTL?%s" % (
+                      codes, urlencode({"format": "json", "date": "%d:%d" % (a.first, a.last), "per_page": 500, "page": page}))
+                  doc = get_json(url, log)
+                  rows += parse_worldbank(doc)
+                  if not doc or page >= int(doc[0].get("pages", 1)):
+                      break
+                  page += 1
+              return rows
+
+
+          # ---------------- Eurostat (JSON-stat 2.0) ----------------
+          def parse_jsonstat(doc):
+              """Return list of (geo, year, unit_key, value) from a JSON-stat 2.0 dataset."""
+              ids, size, dim, vals = doc["id"], doc["size"], doc["dimension"], doc.get("value", {})
+              if isinstance(vals, list):
+                  vals = {i: v for i, v in enumerate(vals) if v is not None}
+              cats = []
+              for d in ids:
+                  idx = dim[d]["category"]["index"]
+                  if isinstance(idx, list):
+                      idx = {k: i for i, k in enumerate(idx)}
+                  cats.append({i: k for k, i in idx.items()})
+              out = []
+              for flat, v in vals.items():
+                  flat = int(flat); pos = []
+                  for n in reversed(size):
+                      pos.append(flat % n); flat //= n
+                  pos = list(reversed(pos))
+                  rec = {d: cats[j][pos[j]] for j, d in enumerate(ids)}
+                  out.append((rec.get("geo"), rec.get("time"), rec.get("unit", ""), v, rec))
+              return out
+
+
+          def run_eurostat(a, log):
+              geos = sorted(set(ES_GEO.values()))
+              base = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/"
+              tried = [("prc_hicp_aind", {"coicop": "CP00"}), ("prc_hicp_aind", {"coicop18": "TOTAL"}),
+                       ("prc_hicp_ainr", {"coicop18": "TOTAL"}), ("prc_hicp_aind", {})]
+              for ds, flt in tried:
+                  q = [("format", "JSON"), ("lang", "EN"), ("sinceTimePeriod", str(a.first)), ("untilTimePeriod", str(a.last))]
+                  q += list(flt.items()) + [("geo", g) for g in geos]
+                  doc = get_json(base + ds + "?" + urlencode(q), log)
+                  if not doc or "value" not in doc:
+                      continue
+                  rows = []
+                  for geo, t, unit, v, rec in parse_jsonstat(doc):
+                      if geo in ES_BACK and t and str(t)[:4].isdigit():
+                          # keep index-level units only (not rates of change)
+                          u = str(unit).upper()
+                          if "INX" in u or "INDEX" in u or u.startswith("I"):
+                              rows.append(("eurostat", ES_BACK[geo], int(str(t)[:4]), v, "%s %s" % (ds, unit)))
+                  if rows:
+                      # one unit only: prefer the unit with the most rows
+                      from collections import Counter
+                      best = Counter(r[4] for r in rows).most_common(1)[0][0]
+                      log.write("using %s\n" % best)
+                      return [r for r in rows if r[4] == best]
+                  log.write("no index-level rows from %s %s\n" % (ds, flt))
+              return []
+
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--source", required=True, choices=["eurostat", "worldbank"])
+              ap.add_argument("--first", type=int, default=2015)
+              ap.add_argument("--last", type=int, default=2026)
+              ap.add_argument("--out", default="cpi_out")
+              a = ap.parse_args()
+              os.makedirs(a.out, exist_ok=True)
+              with open(os.path.join(a.out, "cpi_%s_log.txt" % a.source), "w") as log:
+                  rows = run_worldbank(a, log) if a.source == "worldbank" else run_eurostat(a, log)
+              rows.sort(key=lambda r: (r[1], r[2]))
+              with open(os.path.join(a.out, "cpi_%s.csv" % a.source), "w", newline="") as fh:
+                  w = csv.writer(fh); w.writerow(["source", "country", "year", "index", "unit_or_base"]); w.writerows(rows)
+              print("%s: %d rows, %d countries" % (a.source, len(rows), len({r[1] for r in rows})))
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+          python3 -m py_compile cpi/cpi_pull_v2.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpi-script
+          path: cpi/cpi_pull_v2.py
+
+  pull:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [eurostat, worldbank]
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: cpi-script
+          path: cpi
+      - name: Pull ${{ matrix.source }}
+        run: |
+          python cpi/cpi_pull_v2.py --source ${{ matrix.source }} --first ${{ inputs.first_year }} --last ${{ inputs.last_year }} --out out
+          cat out/cpi_${{ matrix.source }}_log.txt | head -40
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cpi-${{ matrix.source }}
+          path: out/
+          if-no-files-found: ignore
+
+  combine:
+    needs: pull
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cpi-*
+          merge-multiple: true
+          path: all
+      - name: Write deflator script
+        run: |
+          cat > cpi_deflate_v2.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          cpi_deflate_v2.py - build 2025-price deflators from the raw CPI pulls (country-specific CPI, native currency, no FX).
+
+          Input  (--in dir): cpi_eurostat.csv, cpi_worldbank.csv  (source,country,year,index,unit_or_base)
+          Output (--out dir):
+            cpi_deflators.csv       country,year,cpi_source,index,base_year,factor_to_base   (long; one row per country-year)
+            cpi_deflators_wide.csv  country,cpi_source,base_year,<year columns of factor_to_base>
+            cpi_deflate_report.txt  which source each country used, base year used, gaps
+          Rule: factor_to_base = index[base_year] / index[year]. Multiply a nominal amount from <year> by it to express
+          it in base-year (2025) money. One source per country, never spliced: Eurostat HICP preferred, World Bank CPI if
+          Eurostat lacks the base year or any year of the window. If the base year is missing for a country the latest
+          year available is used and flagged in the report.
+          """
+          import argparse, csv, os, sys
+          from collections import defaultdict
+
+
+          def load(path, src):
+              d = defaultdict(dict)
+              if os.path.exists(path):
+                  for r in csv.DictReader(open(path, newline="")):
+                      try: d[r["country"]][int(r["year"])] = float(r["index"])
+                      except (ValueError, KeyError): pass
+              return d
+
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--in", dest="inp", default="all")
+              ap.add_argument("--out", default="all")
+              ap.add_argument("--base", type=int, default=2025)
+              ap.add_argument("--first", type=int, default=2021)
+              a = ap.parse_args()
+              es, wb = load(os.path.join(a.inp, "cpi_eurostat.csv"), "eurostat"), load(os.path.join(a.inp, "cpi_worldbank.csv"), "worldbank")
+              window = range(a.first, a.base + 1)
+              long_rows, wide, rep = [], [], []
+              for c in sorted(set(es) | set(wb)):
+                  pick = None
+                  for name, d in (("eurostat", es), ("worldbank", wb)):
+                      s = d.get(c, {})
+                      if s and all(y in s for y in window):
+                          pick = (name, s); break
+                  note = ""
+                  if pick is None:   # no source covers the full window: use the one with the latest data, flag it
+                      cand = [(max(d.get(c, {0: 0})), name, d.get(c, {})) for name, d in (("eurostat", es), ("worldbank", wb)) if d.get(c)]
+                      if not cand:
+                          continue
+                      _, name, s = max(cand); pick = (name, s)
+                  name, s = pick
+                  base = a.base if a.base in s else max(s)
+                  if base != a.base: note = "BASE YEAR %d MISSING, used %d" % (a.base, base)
+                  missing = [y for y in window if y not in s]
+                  if missing: note += (" " if note else "") + "missing years: " + ",".join(map(str, missing))
+                  for y in sorted(s):
+                      long_rows.append((c, y, name, s[y], base, round(s[base] / s[y], 6)))
+                  wide.append([c, name, base] + [round(s[base] / s[y], 6) if y in s else "" for y in window])
+                  rep.append("%s: source=%s base=%d years=%d-%d %s" % (c, name, base, min(s), max(s), note or "OK"))
+              os.makedirs(a.out, exist_ok=True)
+              with open(os.path.join(a.out, "cpi_deflators.csv"), "w", newline="") as fh:
+                  w = csv.writer(fh); w.writerow(["country", "year", "cpi_source", "index", "base_year", "factor_to_base"]); w.writerows(long_rows)
+              with open(os.path.join(a.out, "cpi_deflators_wide.csv"), "w", newline="") as fh:
+                  w = csv.writer(fh); w.writerow(["country", "cpi_source", "base_year"] + ["f%d" % y for y in window]); w.writerows(wide)
+              open(os.path.join(a.out, "cpi_deflate_report.txt"), "w").write("\n".join(rep) + "\n")
+              print("\n".join(rep))
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+          python3 -m py_compile cpi_deflate_v2.py
+      - name: Build 2025-price deflators
+        run: python3 cpi_deflate_v2.py --in all --out all --base ${{ inputs.base_year }} --first ${{ inputs.window_first }}
+      - run: ls -l all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpi-combined
+          path: all/
 
