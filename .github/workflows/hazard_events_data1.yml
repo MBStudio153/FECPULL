@@ -1,1 +1,57 @@
+name: hazard-events-data1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  usgs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: USGS earthquake counts by year (magnitude 6+ and 7+), world
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, time, urllib.request
+          res = {}
+          log = open("out/log.txt", "w")
+          for y in range(2000, 2027):
+              end = "2026-12-31" if y == 2026 else "%d-12-31" % y
+              row = {}
+              for m in (6, 7):
+                  url = "https://earthquake.usgs.gov/fdsnws/event/1/count?starttime=%d-01-01&endtime=%s&minmagnitude=%d" % (y, end, m)
+                  for a in range(4):
+                      try:
+                          row["m%d" % m] = int(urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "kaim-research/1.0"}), timeout=60).read().decode().strip())
+                          break
+                      except Exception as e:
+                          log.write("%d m%d attempt %d %r\n" % (y, m, a, e)); log.flush(); time.sleep(10)
+                  time.sleep(1)
+              res[y] = row
+              log.write("%d %s\n" % (y, row)); log.flush()
+          json.dump(res, open("out/usgs_quake_counts.json", "w"))
+          PY
+          python3 q.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hazard-events-usgs
+          path: out/
+  spc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: NOAA Storm Prediction Center tornado database (1950 to latest)
+        run: |
+          mkdir -p out
+          for y in 2026 2025 2024; do
+            f=1950-${y}_actual_tornadoes.csv
+            if curl -fsSL -A "kaim-research/1.0" -o out/$f "https://www.spc.noaa.gov/wcm/data/$f"; then echo "got $f" >> out/log.txt; break; else echo "no $f" >> out/log.txt; rm -f out/$f; fi
+          done
+          curl -fsSL -A "kaim-research/1.0" -o out/spc_wcm_index.html "https://www.spc.noaa.gov/wcm/" || echo "no index" >> out/log.txt
+          ls -la out >> out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hazard-events-spc
+          path: out/
 
