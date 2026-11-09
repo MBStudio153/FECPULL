@@ -1,1 +1,628 @@
+# idmap_pull_v1.yml - ONE-FILE workflow: LEI -> ISIN -> ticker map for the 384 ESEF pilot companies.
+# Save it in your repo as:  .github/workflows/idmap_pull_v1.yml
+# Then: Actions tab > "ID map pull v1" > Run workflow. No inputs, no other files needed.
+#
+# Sources (free, no keys): GLEIF (LEI records and linked ISINs) and OpenFIGI (ISIN to ticker).
+# 6 small jobs start at the same time (about 10-15 minutes each), then one job stacks them.
+# Download "id-map" and send it back: id_map.csv is the file that goes into the workbook's ID Map sheet.
+
+name: ID map pull v1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write script and company list
+        run: |
+          mkdir -p idmap
+          cat > idmap/idmap_pull_v1.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          idmap_pull_v1.py - identifier map for the ESEF pilot companies: LEI -> ISIN -> ticker.
+
+          Standard library only. Two free public sources, no API keys:
+            GLEIF  (api.gleif.org)      LEI record (legal name, country) and the ISINs linked to each LEI
+            OpenFIGI (api.openfigi.com) ISIN -> ticker, exchange code, security type
+
+          Usage: python idmap_pull_v1.py --leis leis.csv --chunk 1 --of 4 --out out
+
+          Output (one row per LEI, same columns in every chunk so chunks can be stacked):
+            id_map_<chunk>.csv        lei,country,name,gleif_name,isin,ticker,exch_code,figi,security_type,name_figi,confidence,n_isins,n_checked,notes
+            id_all_figi_<chunk>.csv   every FIGI row found (for review)
+            idmap_<chunk>_log.txt     requests and errors
+
+          Choice rule for the main security of a company: among FIGI rows of type 'Common Stock', prefer
+          the exchange code typical for the company's country, else the first; if no common stock, the
+          first 'Depositary Receipt' or any row, with confidence 'low'. ISINs per LEI are capped (--max-isins)
+          because banks and large issuers carry thousands of bond ISINs; a note says when the cap applied.
+          Review before relying on a row: confidence 'high' = common stock on the home exchange.
+          """
+          import argparse, csv, json, os, sys, time
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import quote
+
+          UA = "KAIM-Research-ID-map (research use)"
+          HOME_EXCH = {"FR": "FP", "SE": "SS", "GB": "LN", "NL": "NA", "DK": "DC", "FI": "FH", "NO": "NO", "BE": "BB", "AT": "AV",
+                       "IT": "IM", "ES": "SM", "GR": "GA", "PL": "PW", "HU": "HB", "IS": "IR", "LU": "LX", "DE": "GR", "IE": "ID"}
+          FIELDS = ["lei", "country", "name", "gleif_name", "isin", "ticker", "exch_code", "figi", "security_type", "name_figi",
+                    "confidence", "n_isins", "n_checked", "notes"]
+
+
+          def http(url, log, data=None, tries=5, headers=None):
+              delay = 3.0
+              for i in range(tries):
+                  try:
+                      h = {"User-Agent": UA, "Accept": "application/json"}
+                      if data is not None:
+                          h["Content-Type"] = "application/json"
+                      if headers:
+                          h.update(headers)
+                      with urlopen(Request(url, data=data, headers=h), timeout=90) as r:
+                          return json.loads(r.read())
+                  except HTTPError as e:
+                      log.write("HTTP %s %s\n" % (e.code, url[:140]))
+                      if e.code in (400, 404):
+                          return None
+                      if e.code == 429:
+                          time.sleep(max(delay, 20)); delay *= 2; continue
+                  except (URLError, TimeoutError, ConnectionError, ValueError) as e:
+                      log.write("ERR %s %s\n" % (e, url[:140]))
+                  time.sleep(delay); delay *= 2
+              return None
+
+
+          def gleif(lei, log, max_isins):
+              rec = http("https://api.gleif.org/api/v1/lei-records/%s" % quote(lei), log)
+              name = ""
+              if rec and rec.get("data"):
+                  name = (((rec["data"].get("attributes") or {}).get("entity") or {}).get("legalName") or {}).get("name", "")
+              isins, page = [], 1
+              while True:
+                  d = http("https://api.gleif.org/api/v1/lei-records/%s/isins?page%%5Bsize%%5D=200&page%%5Bnumber%%5D=%d" % (quote(lei), page), log)
+                  if not d or not d.get("data"):
+                      break
+                  isins += [x["attributes"]["isin"] for x in d["data"] if x.get("attributes", {}).get("isin")]
+                  last = ((d.get("meta") or {}).get("pagination") or {}).get("lastPage", 1)
+                  if page >= last or len(isins) >= max_isins * 5:
+                      break
+                  page += 1
+                  time.sleep(1.1)
+              return name, isins
+
+
+          def order_isins(isins, country):
+              """Home-country ISINs first (equity is usually under the home prefix), then the rest."""
+              home = [i for i in isins if i[:2] == country]
+              rest = [i for i in isins if i[:2] != country]
+              return home + rest
+
+
+          def parse_figi(resp, isins):
+              """resp is a list aligned with the request jobs; each item {'data':[...]} or {'warning':..}."""
+              rows = []
+              for isin, item in zip(isins, resp or []):
+                  for d in (item or {}).get("data", []) or []:
+                      rows.append({"isin": isin, "ticker": d.get("ticker", ""), "exch_code": d.get("exchCode", ""), "figi": d.get("figi", ""),
+                                   "security_type": d.get("securityType2") or d.get("securityType", ""), "name_figi": d.get("name", "")})
+              return rows
+
+
+          def figi(isins, log):
+              out = []
+              for i in range(0, len(isins), 10):
+                  part = isins[i:i + 10]
+                  body = json.dumps([{"idType": "ID_ISIN", "idValue": x} for x in part]).encode()
+                  resp = http("https://api.openfigi.com/v3/mapping", log, data=body)
+                  out += parse_figi(resp, part)
+                  time.sleep(2.6)          # unauthenticated limit is about 25 requests per minute
+              return out
+
+
+          def choose(rows, country):
+              cs = [r for r in rows if r["security_type"] == "Common Stock"]
+              home = HOME_EXCH.get(country, "")
+              for r in cs:
+                  if r["exch_code"] == home:
+                      return r, "high"
+              if cs:
+                  return cs[0], "medium"
+              dr = [r for r in rows if "Depositary" in r["security_type"]]
+              if dr:
+                  return dr[0], "low"
+              return (rows[0], "low") if rows else (None, "")
+
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--leis", required=True); ap.add_argument("--chunk", type=int, default=1); ap.add_argument("--of", type=int, default=1)
+              ap.add_argument("--out", default="idmap_out"); ap.add_argument("--max-isins", type=int, default=25)
+              a = ap.parse_args()
+              os.makedirs(a.out, exist_ok=True)
+              todo = list(csv.DictReader(open(a.leis, encoding="utf-8")))
+              todo = [r for i, r in enumerate(todo) if i % a.of == a.chunk - 1]
+              log = open(os.path.join(a.out, "idmap_%d_log.txt" % a.chunk), "w")
+              fo = open(os.path.join(a.out, "id_map_%d.csv" % a.chunk), "w", newline="", encoding="utf-8")
+              fa = open(os.path.join(a.out, "id_all_figi_%d.csv" % a.chunk), "w", newline="", encoding="utf-8")
+              w = csv.DictWriter(fo, fieldnames=FIELDS); w.writeheader()
+              wa = csv.DictWriter(fa, fieldnames=["lei", "isin", "ticker", "exch_code", "figi", "security_type", "name_figi"]); wa.writeheader()
+              for n, r in enumerate(todo, 1):
+                  lei, ctry = r["lei"], r["country"]
+                  gname, isins = gleif(lei, log, a.max_isins)
+                  ordered = order_isins(isins, ctry)[: a.max_isins]
+                  rows = figi(ordered, log) if ordered else []
+                  for x in rows:
+                      wa.writerow({"lei": lei, **x})
+                  pick, conf = choose(rows, ctry)
+                  notes = []
+                  if not isins: notes.append("no ISIN on GLEIF")
+                  if len(isins) > a.max_isins: notes.append("ISIN list capped at %d of %d" % (a.max_isins, len(isins)))
+                  if isins and not rows: notes.append("ISINs found but no FIGI match")
+                  w.writerow({"lei": lei, "country": ctry, "name": r["name"], "gleif_name": gname,
+                              "isin": pick["isin"] if pick else "", "ticker": pick["ticker"] if pick else "",
+                              "exch_code": pick["exch_code"] if pick else "", "figi": pick["figi"] if pick else "",
+                              "security_type": pick["security_type"] if pick else "", "name_figi": pick["name_figi"] if pick else "",
+                              "confidence": conf, "n_isins": len(isins), "n_checked": len(ordered), "notes": "; ".join(notes)})
+                  fo.flush(); fa.flush()
+                  if n % 10 == 0:
+                      print("chunk %d: %d/%d" % (a.chunk, n, len(todo)), flush=True)
+              print("chunk %d done: %d companies" % (a.chunk, len(todo)))
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+          cat > idmap/leis.csv <<'LEIEOF'
+          lei,country,name,ccy
+          5299005VO3GJ18GL5F14,AT,AMAG Austria Metall AG,EUR
+          529900QI445M00DK4407,AT,AUSTRIACARD HOLDINGS AG,EUR
+          549300TAT2TADBW0WR70,AT,BOREALIS AG,EUR
+          39120001KULK7200U106,AT,Bundesanzeiger Verlag GmbH,EUR
+          52990021YEMY298JY727,AT,FACC AG,EUR
+          529900BKFJBI0QRDJH63,AT,Lenzing Aktiengesellschaft,EUR
+          529900IFAV83BX8O1O91,AT,PALFINGER AG,EUR
+          5299008TBI1EUJJSWP89,AT,PIERER Mobility AG,EUR
+          529900YBFN87N63PFT67,AT,Pierer Industrie AG,EUR
+          724500UWG6A61XNA3Y36,AT,RHI Magnesita N.V.,EUR
+          529900DS2PAVS3K9RV51,AT,Rosenbauer International AG,EUR
+          213800SLDKXWKT6E3381,BE,ACACIA PHARMA GROUP PLC,USD
+          549300IHBDUTUNQJJB79,BE,AGFA-GEVAERT,EUR
+          549300N17QCD827TII61,BE,BARCO,EUR
+          549300J4HOJL5KG8HY54,BE,BIOCARTIS GROUP,EUR
+          549300HFIIMTOP1DFR76,BE,BioSenic,EUR
+          69940040QC7E3C0G3X07,BE,Biotalys,EUR
+          549300ORR0M8XF56OI64,BE,CELYAD ONCOLOGY,EUR
+          549300LD2NEVEYBEBI54,BE,CRESCENT,EUR
+          549300R6YGQQ24P6WW72,BE,DECEUNINCK,EUR
+          549300J0AJACIPKLTD62,BE,EVS BROADCAST EQUIPMENT,EUR
+          549300QKJ78IY0IOV655,BE,Galapagos NV,EUR
+          699400FG6E2AD50YHF38,BE,Galapagos SRP 2021,EUR
+          213800ZFW446QIHAB654,BE,HYBRID SOFTWARE GROUP PLC,EUR
+          875500LZIWS7QEQE0I73,BE,Hyloris Pharmaceuticals,EUR
+          5493002RVRZ1S3CPUI26,BE,Ion Beam Applications,EUR
+          5493004CXYDPCZ5RQK28,BE,MATERIALISE,EUR
+          549300J3MG9F9B5FY646,BE,MDxHealth,USD
+          549300QRPSGOJRPUFO80,BE,MELEXIS,EUR
+          5493002FDD273HTEKK14,BE,Mithra Pharmaceuticals,EUR
+          5493008SR6XZECH6BN71,BE,NV BEKAERT SA,EUR
+          5493002O1ESKZ18OXR80,BE,NYXOAH,EUR
+          549300VWY8KVDFKLDM59,BE,Oxurion,EUR
+          549300R8K43AXHYP5M15,BE,RECTICEL,EUR
+          549300MMVL80RTBP3O28,BE,SOLVAY,EUR
+          549300060XNJ90PLNS10,BE,SYENSQO,EUR
+          2138008J191VLSGY5A09,BE,U C B,EUR
+          21380029O1RSZIAVOR95,BE,UCB BIOPHARMA,EUR
+          254900QIETDP1T932G86,BE,Unifiedpost Group,EUR
+          5493003UDPENPUQBJH65,BE,X-Fab Silicon Foundries,USD
+          254900LLIROXU0TDYG54,BE,"פייטון פלאנר מגנטיקס בע""מ",USD
+          549300WXD34E8PPO0887,DK,3SHAPE HOLDING A/S,DKK
+          894500GOC2F65II74F08,DK,ADFORM A/S,EUR
+          894500E4VTG4S81Y1881,DK,AKI Therapeutics A/S,DKK
+          529900SGCREUZCZ7P020,DK,ALK-ABELLÓ A/S,DKK
+          5299008W2A69WX355710,DK,AMBU A/S,DKK
+          894500AW5ZWMYUZN1V70,DK,AQUAPORIN A/S,DKK
+          549300B66JN3W3J8GH73,DK,ASCENDIS PHARMA A/S,EUR
+          213800ATZVDWWKJ8NI47,DK,ASETEK A/S,USD
+          2138006JCDVYIN6INP51,DK,BAVARIAN NORDIC A/S,DKK
+          5299004SWFL5JAN4W830,DK,BIOPORTO A/S,DKK
+          213800ZFR2RIVOXEKP28,DK,BITTEN OG MADS CLAUSENS FOND,DKK
+          549300MKPW8ZF3E8MW37,DK,CHR. HANSEN HOLDING A/S,EUR
+          529900NN7SOJ5QG82X67,DK,COLOPLAST A/S,DKK
+          5493007I2KABJNYPD639,DK,DANFOSS A/S,EUR
+          213800RM6L9LN78BVA56,DK,DEMANT A/S,DKK
+          2138003JHUE8O8Z9AW36,DK,ELLAB A/S,DKK
+          529900MTJPDPE4MHJ122,DK,GENMAB A/S,DKK
+          52990007PTGDTY54X103,DK,GRUNDFOS HOLDING A/S,DKK
+          254900T17RRFZONO6W53,DK,Gubra A/S,DKK
+          5493006R4KC2OI5D3470,DK,H. LUNDBECK A/S,DKK
+          52990077KVK7QCK2NG31,DK,LEO Pharma A/S,DKK
+          254900JH964PYU6MC463,DK,LUNDBECKFONDEN,DKK
+          549300CD4NK2BVJ4VL20,DK,NORDIC BIOSCIENCE HOLDING A/S,DKK
+          549300DAQ1CVT6CXN342,DK,NOVO NORDISK A/S,DKK
+          529900T6WNZXD2R3JW38,DK,NOVOZYMES A/S,DKK
+          529900FSU45YYVLKB451,DK,Nilfisk Holding A/S,EUR
+          529900UTAHSVRYZL0380,DK,Novo Nordisk Fonden,DKK
+          254900EFJQOP8MJY7P44,DK,Oterra Holding ApS,EUR
+          2138008SUI4D917FKN20,DK,Pharma Equity Group A/S,DKK
+          5493004IM45YLQPU2R19,DK,ResoTher Pharma A/S,DKK
+          5299000WVEJNSG42AK88,DK,SIMCORP A/S,EUR
+          213800M9GGJ3GNKQOC39,DK,SITECORE HOLDING III A/S,EUR
+          894500WXW7NUVQF4I210,DK,SITEIMPROVE A/S,USD
+          54930025OZD2GGSQ7L42,DK,Strategic Partners A/S,DKK
+          984500981D136F0C7018,DK,T&W Medical A/S,DKK
+          5299000CU2DGFP8LJ124,DK,UNION therapeutics A/S,DKK
+          549300DYMC8BGZZC8844,DK,VESTAS WIND SYSTEMS A/S,EUR
+          2138001F77YN7UTCOE28,DK,WILLIAM DEMANT INVEST A/S,DKK
+          549300FM1G5Q7DY0FQ65,DK,WS Audiology A/S,EUR
+          549300ITBB1ULBL4CZ12,DK,ZEALAND PHARMA A/S,DKK
+          959800HSSNXWRKBK4N60,ES,GRIFOLS S.A.,EUR
+          9598000ANNAL42UJ7X28,ES,LOGISTA INTEGRAL SA,EUR
+          959800QWKZ45ZQC2AV58,ES,"PHARMA MAR, S.A.",EUR
+          9598004BR8D81D3M1D64,ES,SIEMENS GAMESA RENEWABLE ENERGY SA,EUR
+          743700ULKFAAEA2N3D13,FI,Basware Oyj,EUR
+          9845006BFDJF0375E466,FI,F-Secure Oyj,EUR
+          743700BKTW4EQIVKYY42,FI,Fiskars Oyj Abp,EUR
+          5493002B0GOVF42KWX33,FI,Hiab Oyj,EUR
+          5493007050SJVMXN6L29,FI,Huhtamäki Oyj,EUR
+          636700Z25ZQXLMZ3CY73,FI,Kalmar Oyj,EUR
+          549300R0VN9C371W0E07,FI,METSO OYJ,EUR
+          2138007FRMWVPUDCMA45,FI,NELES OYJ,EUR
+          549300A0JPRWG1KI7U06,FI,Nokia Oyj,EUR
+          74370029VAHCXDR7B745,FI,Orion Oyj,EUR
+          5493009YRUJJDCFF0R80,FI,Outokumpu Oyj,EUR
+          743700JHE9365SIHRE72,FI,Purmo Group Oyj,EUR
+          74370083282NHIP4QD02,FI,Raisio Oyj,EUR
+          7437007N96FK4N3WHT09,FI,SSH Communications Security Oyj,EUR
+          743700Z1BNFYR9PRDF52,FI,Suominen Oyj,EUR
+          743700RNDD7KU11HW873,FI,Vaisala Oyj,EUR
+          743700P8A4M2MREWN035,FI,Valoe Oyj,EUR
+          743700ATXLT0MFCHXT16,FI,WithSecure Oyj,EUR
+          969500785J7VIC5YPC96,FR,ABIONYX PHARMA,EUR
+          969500D8TMNB184OJU95,FR,ABIVAX,EUR
+          96950032TUYMW11FB530,FR,ALSTOM,EUR
+          9695000EHMS84KKP2785,FR,ARKEMA,EUR
+          969500I4RF06BPM4AN82,FR,ATEME,EUR
+          969500JJRU82J0JMV072,FR,BALYO,EUR
+          549300AK8Y0LBIQ4T071,FR,BIOMERIEUX SA,EUR
+          9695000UMPNY21KKDO98,FR,BOIRON,EUR
+          969500ZPQQLG72TQND21,FR,COMPAGNIE CHARGEURS INVEST,EUR
+          549300SOSI58J6VIW052,FR,COMPAGNIE GENERALE DES ETABLISSEMENTS MICHELIN,EUR
+          969500KMUQ2B6CBAF162,FR,DANONE,EUR
+          96950065LBWY0APQIM86,FR,DASSAULT SYSTEMES,EUR
+          969500PVBQFWQKVDMD80,FR,DBV TECHNOLOGIES,USD
+          969500LM904RGABQUN96,FR,DEEZER,EUR
+          969500Y8FMHV2BHC0C87,FR,EKINOPS,EUR
+          9695008N1821311KX668,FR,EKINOPS FRANCE,EUR
+          969500SJCEYK6O6RXV95,FR,ESI GROUP,EUR
+          549300M3VH1A3ER1TB49,FR,ESSILORLUXOTTICA,EUR
+          9695002FT7GGI3CKKJ14,FR,EUROAPI,EUR
+          9695007VNRQR6V5TMN85,FR,FERMENTALG,EUR
+          969500F0VMZLK2IULV85,FR,FORVIA,EUR
+          549300NK4AB8OUEX1F54,FR,GENSIGHT BIOLOGICS,EUR
+          213800FUJCKXO9LK3444,FR,GeNeuro SA,EUR
+          9695002Y8420ZB8HJE29,FR,INNATE PHARMA,EUR
+          969500I9Y690B3FZW590,FR,INVENTIVA,EUR
+          549300M6SGDPB4Z94P11,FR,IPSEN,EUR
+          96950004ZQHLJ6V8PJ87,FR,IPSEN PHARMA,EUR
+          529900JI1GG6F7RKVI53,FR,L'OREAL,EUR
+          969500XXRPGD7HCAFA90,FR,LEGRAND,EUR
+          969500T64RILK1RD0852,FR,LYSOGENE,EUR
+          9695008SHP3XTT9QCM25,FR,MANITOU BF,EUR
+          969500R79U6PXCL2FF46,FR,MEDINCELL S.A.,EUR
+          969500667RSYIH8YL895,FR,NANOBIOTIX,EUR
+          96950015FU78G84UIV14,FR,NEXANS,EUR
+          969500EZGEO9W4JXR353,FR,NICOX SA,EUR
+          969500HIUWVGY6NZSM05,FR,OSE IMMUNOTHERAPEUTICS,EUR
+          9695000KELLFSASOM232,FR,PARROT,EUR
+          969500U8ZZCODU8A9374,FR,PHAXIAM THERAPEUTICS,EUR
+          969500356FAUM2X41Q59,FR,PLANISWARE,EUR
+          969500E35QZFDE7TVG55,FR,PLASTIC OMNIUM,EUR
+          9695003OIX0T7NX72N26,FR,POXEL,EUR
+          549300K4W3A5ITOPTK67,FR,QUADIENT S.A.,EUR
+          969500F7JLTX36OUI695,FR,RENAULT,EUR
+          969500XPWN2DMZQA5X73,FR,SA GENFIT,EUR
+          549300E9PC51EN656011,FR,SANOFI,EUR
+          969500A1YF1XUYYXS284,FR,SCHNEIDER ELECTRIC SE,EUR
+          969500ZR92SQCU9TST26,FR,SOITEC,EUR
+          52990006IVXY7GCSSR39,FR,Sartorius Stedim Biotech,EUR
+          9695002EVBYM5B2OIP31,FR,TARKETT,EUR
+          529900FNDVTQJOVVPZ19,FR,THALES,EUR
+          969500PDJW8N0FSGGK69,FR,TRANSGENE,EUR
+          969500I7C8V1LBIMSM05,FR,UBISOFT ENTERTAINMENT,EUR
+          969500SHQITWXSIS7N89,FR,UNIBAIL-RODAMCO-WESTFIELD SE,EUR
+          969500DCGMF1DNOXFH76,FR,UNIBEL,EUR
+          5493006IH2N2WMIBB742,FR,VALEO,EUR
+          969500DIVIP5VKNW4948,FR,VALNEVA,EUR
+          969500MQKPVEWTQIRT36,FR,VERIMATRIX,USD
+          969500TQ4OAZZXSUPZ18,FR,VILMORIN & CIE,EUR
+          969500FCVQ5SLAAUJV59,FR,VIRIDIEN,USD
+          4N6SD705LP5XZKA2A097,FR,Vantiva,EUR
+          549300NXL2KSHKJXTU29,GB,ACG METALS LIMITED,USD
+          213800YB4G7YN21NLL72,GB,ALLIED MINDS PLC,USD
+          213800ZXTO21EU4VMH37,GB,ALPHAWAVE IP GROUP PLC,USD
+          213800HRE3FQJ6RK4H10,GB,ARGENT BIOPHARMA LIMITED,AUD
+          213800IR8G8LCZH4BO27,GB,AVAST PLC,USD
+          213800XHATUM2LFMKG16,GB,AVEVA GROUP PLC,GBP
+          213800JM1AN62REBWA71,GB,AVON TECHNOLOGIES PLC,USD
+          213800LS272L4FIDOH92,GB,CONVATEC GROUP PLC,USD
+          213800PC5S5P9CSNFC89,GB,DARKTRACE PLC,USD
+          213800J4UVB5OWG8VX82,GB,DECHRA PHARMACEUTICALS PLC,GBP
+          5493000HZTVUYLO1D793,GB,GSK PLC,GBP
+          549300PSB3WWEODCUP19,GB,HALEON PLC,GBP
+          549300BNS685UXH4JI75,GB,HIKMA PHARMACEUTICALS PUBLIC LIMITED COMPANY,USD
+          2138008S5FL78ITZRN66,GB,HUNTING PLC,USD
+          213800V3NCQTY7IED471,GB,INDIVIOR PLC,USD
+          213800HOSJEZO1KOCV33,GB,NANOCO GROUP PLC,GBP
+          213800S1GVQNXQ15K851,GB,OXFORD BIOMEDICA PLC,GBP
+          2138005SRWT4998BCE35,GB,OXFORD CANNABINOID TECHNOLOGIES HOLDINGS PLC,GBP
+          213800J364EZD6UCE231,GB,OXFORD INSTRUMENTS PLC,GBP
+          213800IRWQ2Q6M2CDW55,GB,OXFORD NANOPORE TECHNOLOGIES PLC,GBP
+          213800LVPDNO2Z9T9I39,GB,PURETECH HEALTH PLC,USD
+          213800HONYSAXTG6KS11,GB,RAINBOW RARE EARTHS LIMITED,USD
+          984500F5FB0E4FEBED17,GB,RASPBERRY PI HOLDINGS PLC,USD
+          213800EC7997ZBLZJH69,GB,ROLLS-ROYCE HOLDINGS PLC,GBP
+          X57JK1U580XATGR67572,GB,ROLLS-ROYCE PLC,GBP
+          549300Q7EXQQH6KF7Z84,GB,RTW BIOTECH OPPORTUNITIES LTD,USD
+          254900P4SISIWOR9RH34,GB,Roquefort Therapeutics PLC,GBP
+          213800ZTMDN8S67S1H61,GB,SMITH & NEPHEW PLC,USD
+          213800HKCUNWP1916L38,GB,SPIRENT COMMUNICATIONS PLC,USD
+          213800UYNPHAUNHPXL67,GB,VICTREX PLC,GBP
+          213800MXEC3KAOBBPO57,GB,XAAR PLC,GBP
+          213800I7RWQ3FV72EZ26,GB,XP POWER LIMITED,GBP
+          213800FLQUB9J289RU66,GB,"באטמ תקשורת מתקדמת בע""מ",USD
+          213800NW1S2T9JRVU437,GR,A.S. ΕΜΠΟΡΙΚΗ-ΒΙΟΜΗΧΑΝΙΚΗ ΕΤΑΙΡΙΑ Η/Υ & ΠΑΙΧΝΙΔΙΩΝ Α.Ε.,EUR
+          213800XNTZ8P8L74HM35,GR,BALLY'S INTRALOT Α.Ε.,EUR
+          2138007CWC1NYS6B6N87,GR,"EPSILON NET - ΑΝΩΝΥΜΗ ΕΤΑΙΡΕΙΑ ΠΛΗΡΟΦΟΡΙΚΗΣ, ΕΚΠΑΙΔΕΥΣΗΣ ΚΑΙ ΠΡΟΪΟΝΤΩΝ ΥΨΗΛΗΣ ΤΕΧΝΟΛΟΓΙΑΣ",EUR
+          213800SD9V875QXDRR32,GR,FLEXOPACK ΑΝΩΝΥΜΗ ΕΜΠΟΡΙΚΗ ΚΑΙ ΒΙΟΜΗΧΑΝΙΚΗ ΕΤΑΙΡΕΙΑ ΠΛΑΣΤΙΚΩΝ,EUR
+          2138003J1IUF4RSQ4K72,GR,FRIGOGLASS A.B.E.E. ΒΙΟΜΗΧΑΝΙΑ ΨΥΚΤΙΚΩΝ ΘΑΛΑΜΩΝ,EUR
+          213800P8775JBN5FEO47,GR,INFORM Π. ΛΥΚΟΣ A.E. ΣΥΜΜΕΤΟΧΩΝ,EUR
+          213800KT8MEUJEJ2KW41,GR,METLEN ENERGY & METALS ΜΟΝΟΠΡΟΣΩΠΗ Α.Ε.,EUR
+          213800WNZ5DCFUMSKM47,GR,PERFORMANCE TECHNOLOGIES ΑΝΩΝΥΜΗ ΕΤΑΙΡΙΑ ΠΛΗΡΟΦΟΡΙΚΗΣ,EUR
+          21380051TUVZ3KYK5G44,GR,PROFILE ΑΝΩΝΥΜΟΣ ΕΜΠΟΡΙΚΗ ΚΑΙ ΒΙΟΜΗΧΑΝΙΚΗ ΕΤΑΙΡΕΙΑ ΠΛΗΡΟΦΟΡΙΚΗΣ,EUR
+          213800BFLX55D42JQM05,GR,"SPACE HELLAS ΑΝΩΝΥΜΗ ΕΤΑΙΡΕΙΑ ΣΥΣΤΗΜΑΤΑ ΚΑΙ ΥΠΗΡΕΣΙΕΣ ΤΗΛΕΠΙΚΟΙΝΩΝΙΩΝ, ΠΛΗΡΟΦΟΡΙΚΗΣ KAI ΑΣΦΑΛΕΙΑΣ-ΙΔΙΩΤΙΚΗ ΕΠΙΧΕΙΡΗΣΗ ΠΑΡΟΧΗΣ ΥΠΗΡΕΣΙΩΝ ΑΣΦΑΛΕΙΑΣ",EUR
+          2138006TYVPO2HY5D247,GR,UNIBIOS ΑΝΩΝΥΜΟΣ ΕΤΑΙΡΙΑ ΣΥΜΜΕΤΟΧΩΝ,EUR
+          21380057JCMNND7C2I20,GR,ΑΓΡΟΤΙΚΟΣ ΟΙΚΟΣ ΣΠΥΡΟΥ ΑΝΩΝΥΜΗ ΕΜΠΟΡΙΚΗ ΚΑΙ ΒΙΟΜΗΧΑΝΙΚΗ ΕΤΑΙΡΙΑ,EUR
+          213800ORBZMLW45PXS28,GR,ΑΛΟΥΜΥΛ ΒΙΟΜΗΧΑΝΙΑ ΑΛΟΥΜΙΝΙΟΥ ΑΕ,EUR
+          213800USC69CRPRGWJ15,GR,"ΑΝΩΝΥΜΗ ΕΜΠΟΡΙΚΗ ΚΑΙ ΒΙΟΜΗΧΑΝΙΚΗ ΕΤΑΙΡΕΙΑ ΦΑΡΜΑΚΕΥΤΙΚΩΝ, ΧΗΜΙΚΩΝ ΚΑΙ ΚΑΛΛΥΝΤΙΚΩΝ ΠΡΟΪΟΝΤΩΝ LAVIPHARM Α.Ε.",EUR
+          21380029I4NIQ9ZXE146,GR,ΑΥΤΟΜΑΤΟΙ ΑΝΑΛΥΤΕΣ-ΔΙΑΓΝΩΣΤΙΚΑ ΑΝΤΙΔΡΑΣΤΗΡΙΑ ΚΑΙ ΙΔΙΩΤΙΚΑ ΔΙΑΓΝΩΣΤΙΚΑ ΕΡΓΑΣΤΗΡΙΑ-MEDICON HELLAS ΑΝΩΝΥΜΗ ΕΤΑΙΡΕΙΑ,EUR
+          213800RDLQSVI1IFPZ11,GR,ΒΙΟΚΑΡΠΕΤ ΑΝΩΝΥΜΗ ΕΤΑΙΡΕΙΑ ΒΙΟΜΗΧΑΝΙΚΕΣ ΚΑΙ ΕΜΠΟΡΙΚΕΣ ΕΠΙΧΕΙΡΗΣΕΙΣ,EUR
+          2138003TO2MTRHWVP686,GR,ΓΕΚ ΤΕΡΝΑ Α.Ε.,EUR
+          213800A8PXGBSRJIEH28,GR,ΕΒΡΟΦΑΡΜΑ ΒΙΟΜΗΧΑΝΙΑ ΓΑΛΑΚΤΟΣ ΑΝΩΝΥΜΗ ΒΙΟΜΗΧΑΝΙΚΗ & ΕΜΠΟΡΙΚΗ ΕΤΑΙΡΕΙΑ Α.Ε.,EUR
+          21380044V7NMV5WGP427,GR,ΕΛΛΗΝΙΚΗ ΒΙΟΜΗΧΑΝΙΑ ΜΑΡΜΑΡΩΝ ΤΕΧΝΙΚΗ & ΤΟΥΡΙΣΤΙΚΗ ΕΤΑΙΡΕΙΑ ΙΚΤΙΝΟΣ ΕΛΛΑΣ ΑΝΩΝΥΜΟΣ ΕΤΑΙΡΕΙΑ,EUR
+          21380054CNOGH2BJQJ59,GR,ΕΤΑΙΡΕΙΑ ΥΔΡΕΥΣΗΣ & ΑΠΟΧΕΤΕΥΣΗΣ ΘΕΣΣΑΛΟΝΙΚΗΣ Α.Ε.,EUR
+          213800OVUEZXGAS3Q539,GR,ΠΑΠΟΥΤΣΑΝΗΣ ΑΝΩΝΥΜΗ ΒΙΟΜΗΧΑΝΙΚΗ ΚΑΙ ΕΜΠΟΡΙΚΗ ΕΤΑΙΡΕΙΑ ΚΑΤΑΝΑΛΩΤΙΚΩΝ ΑΓΑΘΩΝ,EUR
+          213800J1QD8BIB2ICW19,GR,ΠΛΑΣΤΙΚΑ ΘΡΑΚΗΣ ΕΤΑΙΡΕΙΑ ΣΥΜΜΕΤΟΧΩΝ ΑΝΩΝΥΜΟΣ ΕΜΠΟΡΙΚΗ ΕΤΑΙΡΕΙΑ,EUR
+          21380024BQ2ILRDQFI71,GR,"ΠΛΑΣΤΙΚΑ ΚΡΗΤΗΣ, ΑΝΩΝΥΜΟΣ ΒΙΟΜΗΧΑΝΙΚΗ ΚΑΙ ΕΜΠΟΡΙΚΗ ΕΤΑΙΡΕΙΑ",EUR
+          5493006164JBW2E60O73,GR,ΤΕΡΝΑ ΕΝΕΡΓΕΙΑΚΗ ΑΝΩΝΥΜΗ ΒΙΟΜΗΧΑΝΙΚΗ ΕΜΠΟΡΙΚΗ ΤΕΧΝΙΚΗ ΕΤΑΙΡΕΙΑ ΑΕ,EUR
+          549300J6ZJW5IH4WEE46,HU,RICHTER GEDEON VEGYÉSZETI GYÁR NYILVÁNOSAN MŰKÖDŐ RT.,HUF
+          5299008YTLEN09WTHW26,IS,Marel hf.,EUR
+          5067005370C2KK324336,IS,Oculis Holding AG,CHF
+          815600A033443037ED66,IT,DATALOGIC S.P.A.,EUR
+          8156002878BDF0EE4348,IT,DIASORIN S.P.A.,EUR
+          8156004C3711C92F7648,IT,INTERCOS S.P.A.,EUR
+          8156004D03EAA217DB61,IT,PRIMA INDUSTRIE - S.P.A.,EUR
+          815600FBF92FD3531704,IT,RECORDATI INDUSTRIA CHIMICA E FARMACEUTICA S.P.A. IN BREVE RECORDATI S.P.A.,EUR
+          81560035783FD9E2E641,IT,SAES GETTERS S.P.A.,EUR
+          8156007154CD8334D053,IT,TECHNOPROBE S.P.A.,EUR
+          222100DCZBOWV5DZ8372,LU,ALVOTECH,USD
+          2221003P54KEDC3P4Z33,LU,BENEVOLENTAI,GBP
+          549300RY7FWEMUOTIT28,LU,Quant AB,EUR
+          213800C9JTKV8DLW6403,LU,SUSE S.A.,USD
+          MINO79WLOO247M1IL051,NL,AIRBUS SE,EUR
+          7245001I22ND6ZFHX623,NL,ASM International N.V.,EUR
+          724500Y6DUVHQD6OXN27,NL,ASML Holding N.V.,EUR
+          724500XYIJUGXAA5QD70,NL,Akzo Nobel N.V.,EUR
+          724500E5WW4731JJ4G46,NL,Avantium N.V.,EUR
+          7245007A1YFLI2GNYX06,NL,BE Semiconductor Industries N.V.,EUR
+          549300WGC2HZ5J67V817,NL,CNH Industrial N.V.,USD
+          724500BKS1TSAVLTWG46,NL,Corbion N.V.,EUR
+          506700G44V67MPM4BI12,NL,DSM-Firmenich AG,EUR
+          724500IS1M4H9S4SDD39,NL,ER Capital N.V.,EUR
+          5493002ENHZ6NYET7405,NL,EXOR N.V.,EUR
+          7245009QH646WM76PR25,NL,Envipco Holding N.V.,EUR
+          549300RIVY5EX8RCON76,NL,FERRARI N.V.,EUR
+          549300ZWF2ZJDD9EOR96,NL,IVECO GROUP N.V.,EUR
+          724500SNT1MK246AHP04,NL,Koninklijke DSM N.V.,EUR
+          H1FJE8H61JGM1JSGM897,NL,Koninklijke Philips N.V.,EUR
+          254900YF0PQV9APMA050,NL,NX Filtration N.V.,EUR
+          724500DCJ9MPG74JEH91,NL,Pharming Group N.V.,USD
+          54930036WK3GMCN17Z57,NL,QIAGEN N.V.,USD
+          549300RDGCRYZ5QE6513,NL,SBM OFFSHORE N.V.,USD
+          21380068P1DRHMJ8KU70,NL,SHELL PLC,USD
+          549300072P3J1X8NZO35,NL,SIGNIFY N.V.,EUR
+          549300LKT9PW7ZIBDF31,NL,STELLANTIS N.V.,EUR
+          213800Z8NOHIKRI42W10,NL,STMICROELECTRONICS N.V.,USD
+          724500FLODI49NSCIP70,NL,Technip Energies N.V.,EUR
+          7245009C5FZE6G9ODQ71,NL,argenx SE,USD
+          213800MC2SGVSIBN7J53,NO,5TH PLANET GAMES A/S,DKK
+          5493000E25PBC2PXV881,NO,AGILYX ASA,USD
+          2138001UQHM4VZGXUJ19,NO,BENCHMARK HOLDINGS PLC,GBP
+          5967007LIEEXZXFYNS31,NO,CIRCIO HOLDING ASA,NOK
+          5967007LIEEXZXHNM861,NO,GENTIAN DIAGNOSTICS ASA,NOK
+          5967007LIEEXZXHECW11,NO,IDEX BIOMETRICS ASA,USD
+          213800LTM5FFHVRLNM97,NO,Meltwater N.V.,USD
+          5967007LIEEXZXFIGG77,NO,PCI BIOTECH HOLDING ASA,NOK
+          213800T66DRTE6O6BV87,NO,PGS ASA,USD
+          5967007LIEEXZXG8OW35,NO,PHOTOCURE ASA,NOK
+          2138007ZPDNUIHX6Z659,NO,POLIGHT ASA,NOK
+          259400I5R1L3OPCGII81,PL,BIOTON S.A.,PLN
+          259400TYO5Q8SH8TL437,PL,CD PROJEKT S.A.,PLN
+          254900U4ZTZOIOBB4181,PL,"HUUUGE, INC.",USD
+          2594006HZJ8OSNK56U87,PL,PZ Cormay Spółka Akcyjna,PLN
+          259400Q2BUT499PKRE25,PL,RAFAKO Spółka Akcyjna,PLN
+          259400H9PEQYON2NI017,PL,XTPL Spółka Akcyjna,PLN
+          259400RAB30GC3EU1Y11,PL,"Zakłady Magnezytowe ""ROPCZYCE"" S.A.",PLN
+          549300YECS8HKCIMMB67,SE,ASSA ABLOY AB,SEK
+          PY6ZZQWO2IZFZC3IOL08,SE,ASTRAZENECA PLC,USD
+          213800T8PC8Q4FYJZR07,SE,ATLAS COPCO AKTIEBOLAG,SEK
+          A23RUXWKASG834LTMK28,SE,"AUTOLIV, INC.",USD
+          5493004UROJFQSP6RC85,SE,Acast AB (publ),SEK
+          549300OJ44CLMRU8YE43,SE,Active Biotech AB (publ),SEK
+          5493005T3M7CD7XWE013,SE,AddLife AB,SEK
+          549300HGV012CNC8JD22,SE,Aktiebolaget Volvo,SEK
+          549300UCKT2UK88AG251,SE,Alfa Laval AB,SEK
+          549300LC2ER06GDV6565,SE,Alimak Group AB (publ),SEK
+          529900EBHTYGLA6PGP77,SE,Alleima AB,SEK
+          54930036ZLGZG0G19M24,SE,Anoto Group AB,SEK
+          549300OWGJPYKC6JF790,SE,Arjo AB (publ),SEK
+          5493002YR9VCJJPWYN08,SE,Ascelia Pharma AB,SEK
+          549300FE4PT8NDXXNK85,SE,BICO Group AB,SEK
+          21380059QU7IM1ONDJ56,SE,BOLIDEN AB,SEK
+          549300COLY053IGTLD63,SE,BONESUPPORT HOLDING AB,SEK
+          213800IK1TGY858TKZ45,SE,BOULE DIAGNOSTICS AB,SEK
+          549300Y0OI2WVUNHLC33,SE,BioArctic AB,SEK
+          549300UBUJOY2L7TT361,SE,BioGaia AB,SEK
+          549300E7QRHEF2IJUY10,SE,BioInvent International Aktiebolag,SEK
+          529900SR87NBUKX74L58,SE,Biotage AB,SEK
+          549300PVPZO8TNT76B58,SE,Calliditas Therapeutics AB,SEK
+          5493003S6Z6VI7WYFQ06,SE,Camurus AB,SEK
+          529900IUBZBZ0HXFJ114,SE,CellaVision AB,SEK
+          549300TJBPSNZ3DO6B42,SE,Cinclus Pharma Holding AB,SEK
+          549300KSY3P5G8XC0A34,SE,Cint Group AB (publ),EUR
+          549300PSDFYO1ZBFO413,SE,Concejo AB (publ),SEK
+          5493002G9GMTKIP3PW19,SE,Concentric AB,SEK
+          5493006JEXBO6HGRZ244,SE,DORO AB,SEK
+          549300STIPMK5VSA7Y59,SE,Dometic Group AB (publ),SEK
+          549300MWQEN1427O5L53,SE,Duni AB,SEK
+          5493008X1XZR4R5R0P66,SE,Dynavox Group AB,SEK
+          549300Q8B2D2AE8GCW21,SE,EQL Pharma AB,SEK
+          549300RZCKGWRUBPMY22,SE,Egetis Therapeutics AB (publ),SEK
+          54930044O54BK617EP80,SE,Elekta AB (publ),SEK
+          529900I5MSNU451FL670,SE,Elos Medtech AB,SEK
+          549300UNMLWLG6B2R803,SE,Enea Aktiebolag,SEK
+          549300HBZGNQOTYZPJ54,SE,Ependion AB,SEK
+          5493004Q73OEYW1SPE91,SE,Epiroc Aktiebolag,SEK
+          549300X3RXRNVJH7XE65,SE,FM Mattsson AB (publ),SEK
+          5493004YF5D7Z612Z822,SE,Fingerprint Cards AB,SEK
+          549300K7QJ1N1FEG2X81,SE,G5 Entertainment AB (publ),SEK
+          5493003PZ4F570G3W735,SE,Getinge AB (publ),SEK
+          213800FDUNKI9PVKJ456,SE,HAKI Safety AB,SEK
+          549300MN30TBRLYN3465,SE,HEXPOL AB,SEK
+          549300MOY2FDUUDIQ179,SE,HMS Networks AB,SEK
+          54930033BTSY61VHUR49,SE,Haldex Aktiebolag,SEK
+          549300LLEO25ZJJ3NT91,SE,Hansa Biopharma AB,SEK
+          549300WJFW6ILNI4TA80,SE,Hexagon Aktiebolag,EUR
+          54930054EB7KX3MY2Q11,SE,INVISIO AB,SEK
+          549300EKKVQN2J25MJ59,SE,IRRAS AB,SEK
+          549300FISLQ6CEFP1867,SE,Indutrade Aktiebolag,SEK
+          5493006GFBLNB3Y0Y789,SE,Investmentaktiebolaget Latour,SEK
+          529900A9NKQW5UTHBG13,SE,Inwido AB (publ),SEK
+          549300DYEHYCGPBE2016,SE,Lammhults Design Group AB,SEK
+          549300RTLL4VDQRCTW41,SE,Lifco AB (publ),SEK
+          54930085MH6IRQ1JP227,SE,Lindab International AB,SEK
+          529900AFBGFR7ZB50J95,SE,Mendus AB (publ),SEK
+          549300ZOWFLNDFSHNB56,SE,Midsummer AB,SEK
+          9845009F7Q0D56B38270,SE,MilDef Group AB,SEK
+          549300LZSA4S0L54VQ25,SE,Mips AB,SEK
+          549300XFXK7DVGDRP410,SE,Moberg Pharma AB (publ),SEK
+          549300EXME8QXBXILE44,SE,MultiQ International Aktiebolag,SEK
+          549300KYCB37YAVUV523,SE,Munters Group AB,SEK
+          549300S5CCFESE4C6Y07,SE,Mycronic AB (publ),SEK
+          54930030A8V6LH0G1Z92,SE,Nederman Holding Aktiebolag,SEK
+          549300BMCT8IT2CFDH63,SE,Net Insight AB,SEK
+          549300O897ZC5H7CY412,SE,Nordic Legal Entity Identifier AB,SEK
+          5493000T8MZ5GQREJW94,SE,Nordic Waterproofing Holding AB,SEK
+          5493005UBN5S7Y6ROI22,SE,Obducat Aktiebolag,SEK
+          549300J9WWQ5CBYQ1M77,SE,Oncopeptides AB,SEK
+          549300LJ5CCWDPTK9Z08,SE,Orexo AB,SEK
+          549300AVDV7UC14MTH79,SE,Ortivus Aktiebolag,SEK
+          5493004CJOCT273MU397,SE,PROBI Aktiebolag,SEK
+          54930075IJ7TGOK3VC02,SE,Powercell Sweden AB (publ),SEK
+          54930047Z8TEBJTKYX74,SE,Precise Biometrics AB,SEK
+          5493000MATG2DYK19F35,SE,Pricer Aktiebolag,SEK
+          549300TYFVYGS0JFWM28,SE,RaySearch Laboratories AB (publ),SEK
+          549300ZHO4JCQQI13M69,SE,SAAB Aktiebolag,SEK
+          894500JU9WRAJQOVBI12,SE,SKF Group,SEK
+          5299008ZUAXN43LVZF54,SE,Sandvik Aktiebolag,SEK
+          549300FQ3NJRI56LCX32,SE,Sedana Medical AB (publ),SEK
+          5493008GYHJL9PWTC395,SE,Sensys Gatso Group AB,SEK
+          549300JQF174JP0MM382,SE,Senzime AB (publ.),SEK
+          549300365FORUXLUWL17,SE,SinterCast Aktiebolag,SEK
+          254900UBKNY2EJ588J53,SE,Sivers Semiconductors AB,SEK
+          549300MLJ046XFQNVH42,SE,Studsvik AB,SEK
+          549300233PQ1UWNYVK79,SE,Svedbergs Group AB,SEK
+          549300QTCWQBH6VIRT19,SE,Swedish Electromagnet Invest AB (publ),SEK
+          549300124Y3MQI87PT35,SE,Swedish Orphan Biovitrum AB (publ),SEK
+          549300RRYIEFEQ72N546,SE,SynAct Pharma AB,SEK
+          213800FSR9RNDUOTXO25,SE,TELIA COMPANY AB,SEK
+          549300W9JLPW15XIFM52,SE,Telefonaktiebolaget LM Ericsson,SEK
+          54930045LD4XTJCBGS35,SE,Tobii AB,SEK
+          549300VR2P8X3F1UOX13,SE,TradeDoubler Aktiebolag,SEK
+          213800XY16PAWG2PAD14,SE,Trelleborg AB,SEK
+          549300O1V2ZWY6W9GZ14,SE,VBG GROUP AB (publ),SEK
+          549300KTNBPTZLF01130,SE,Vicore Pharma Holding AB,SEK
+          5493001WDZMONMSPPR49,SE,Vitrolife AB,SEK
+          5299000EAMGGBEYP7J33,SE,Volvo Car AB,SEK
+          5493008DKD05APTKQO39,SE,Xbrane Biopharma AB,SEK
+          549300NGRQCNZ3X4L157,SE,Xspray Pharma AB (publ),SEK
+          549300G2464FYLS14B41,SE,Xvivo Perfusion Aktiebolag,SEK
+          549300I9RBIU9DW59H39,SE,Yubico AB,SEK
+          549300EMZ2B768S85S50,SE,engcon AB,SEK
+          LEIEOF
+          python3 -m py_compile idmap/idmap_pull_v1.py
+          wc -l idmap/leis.csv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: idmap-inputs
+          path: idmap/
+
+  pull:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: idmap-inputs
+          path: idmap
+      - name: Pull chunk ${{ matrix.chunk }} of 6
+        run: python idmap/idmap_pull_v1.py --leis idmap/leis.csv --chunk ${{ matrix.chunk }} --of 6 --out out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: idmap-chunk-${{ matrix.chunk }}
+          path: out/
+          if-no-files-found: ignore
+
+  combine:
+    needs: pull
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: idmap-chunk-*
+          merge-multiple: true
+          path: all
+      - name: Stack chunks
+        run: |
+          cd all
+          first=$(ls id_map_*.csv | head -1)
+          head -1 "$first" > id_map.csv
+          for f in id_map_*.csv; do tail -n +2 "$f" >> id_map.csv; done
+          head -1 "$(ls id_all_figi_*.csv | head -1)" > id_all_figi.csv
+          for f in id_all_figi_*.csv; do tail -n +2 "$f" >> id_all_figi.csv; done
+          wc -l id_map.csv id_all_figi.csv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: id-map
+          path: |
+            all/id_map.csv
+            all/id_all_figi.csv
+            all/idmap_*_log.txt
 
