@@ -1,1 +1,63 @@
+name: hazard-events-data3
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  stormevents:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        yrs: ["1996-2005", "2006-2015", "2016-2026"]
+    steps:
+      - name: NOAA NCEI Storm Events, ice storm events by year (counts, deaths, injuries, damage)
+        env:
+          YRS_: ${{ matrix.yrs }}
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import csv, gzip, io, json, os, re, time, urllib.request
+          a, b = [int(x) for x in os.environ["YRS_"].split("-")]
+          base = "https://www.ncei.noaa.gov/pub/data/swdi/stormevents/csvfiles/"
+          log = open("out/log.txt", "w")
+          def get(url):
+              for t in range(4):
+                  try:
+                      return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "kaim-research/1.0"}), timeout=300).read()
+                  except Exception as e:
+                      log.write("%s attempt %d %r\n" % (url, t, e)); log.flush(); time.sleep(15)
+              return None
+          idx = (get(base) or b"").decode("utf-8", "replace")
+          def dmg(s):
+              s = (s or "").strip()
+              if not s: return 0.0
+              m = re.match(r"^([0-9.]+)([KMB]?)$", s)
+              if not m: return 0.0
+              return float(m.group(1)) * {"": 1, "K": 1e3, "M": 1e6, "B": 1e9}[m.group(2)]
+          res = {}
+          for y in range(a, b + 1):
+              m = re.findall(r'StormEvents_details-ftp_v1\.0_d%d_c\d+\.csv\.gz' % y, idx)
+              if not m:
+                  log.write("%d no file listed\n" % y); log.flush(); continue
+              raw = get(base + sorted(m)[-1])
+              if raw is None:
+                  log.write("%d download failed\n" % y); continue
+              d = {"events": 0, "deaths_direct": 0, "deaths_indirect": 0, "injuries": 0, "property_usd": 0.0, "crop_usd": 0.0}
+              for r in csv.DictReader(io.TextIOWrapper(gzip.GzipFile(fileobj=io.BytesIO(raw)), encoding="utf-8", errors="replace")):
+                  if r["EVENT_TYPE"].strip() != "Ice Storm": continue
+                  d["events"] += 1
+                  d["deaths_direct"] += int(r["DEATHS_DIRECT"] or 0); d["deaths_indirect"] += int(r["DEATHS_INDIRECT"] or 0)
+                  d["injuries"] += int(r["INJURIES_DIRECT"] or 0) + int(r["INJURIES_INDIRECT"] or 0)
+                  d["property_usd"] += dmg(r["DAMAGE_PROPERTY"]); d["crop_usd"] += dmg(r["DAMAGE_CROPS"])
+              res[y] = d
+              log.write("%d %s\n" % (y, d)); log.flush()
+          json.dump(res, open("out/ice_storm_%d_%d.json" % (a, b), "w"))
+          PY
+          python3 q.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hazard-events-ice-${{ matrix.yrs }}
+          path: out/
 
