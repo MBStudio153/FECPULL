@@ -1,1 +1,44 @@
+name: hazard-events-data2
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  hurdat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: NOAA National Hurricane Center HURDAT2 (Atlantic and eastern North Pacific)
+        run: |
+          mkdir -p out
+          for b in "hurdat2-" "hurdat2-nepac-"; do
+            idx=$(curl -fsSL -A "kaim-research/1.0" "https://www.nhc.noaa.gov/data/hurdat/" || true)
+            echo "$idx" > out/index_$b.html
+            f=$(echo "$idx" | grep -o "href=\"${b}[0-9][^\"]*\.txt\"" | sed 's/href="//;s/"//' | sort | tail -1)
+            echo "$b -> $f" >> out/log.txt
+            if [ -n "$f" ]; then curl -fsSL -A "kaim-research/1.0" -o "out/$f" "https://www.nhc.noaa.gov/data/hurdat/$f" && echo "got $f" >> out/log.txt; fi
+          done
+          ls -la out >> out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hazard-events-hurdat
+          path: out/
+  ibtracs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: NOAA NCEI IBTrACS (world tropical cyclone best tracks, western Pacific typhoons)
+        run: |
+          mkdir -p out
+          base="https://www.ncei.noaa.gov/data/international-best-track-archive-for-climate-stewardship-ibtracs/v04r01/access/csv"
+          curl -fsSL -A "kaim-research/1.0" -o out/index.html "$base/" || echo "no index" >> out/log.txt
+          for f in ibtracs.WP.list.v04r01.csv ibtracs.ALL.list.v04r01.csv; do
+            if curl -fsSL -A "kaim-research/1.0" -o "out/$f" "$base/$f"; then echo "got $f" >> out/log.txt; else echo "no $f" >> out/log.txt; rm -f "out/$f"; fi
+          done
+          ls -la out >> out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hazard-events-ibtracs
+          path: out/
 
