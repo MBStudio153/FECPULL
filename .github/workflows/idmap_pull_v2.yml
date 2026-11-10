@@ -1,1 +1,405 @@
+# idmap_pull_v2.yml - ONE-FILE workflow: re-run of the identifier map for the 96 companies v1 could not resolve.
+# Save it in your repo as:  .github/workflows/idmap_pull_v2.yml
+# Then: Actions tab > "ID map pull v2" > Run workflow. No inputs and no other files needed.
+#
+# Six small jobs start at the same time (16 companies each) and finish in roughly 15 minutes.
+# Download "id-map-v2" (id_map.csv with a new "method" column, id_all_figi.csv for review, logs).
+# Optional: add a free OpenFIGI API key as a repository secret named OPENFIGI_KEY to run faster.
+# Works without it.
+
+name: ID map pull v2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write script and company list
+        run: |
+          mkdir -p idmap
+          cat > idmap/idmap_pull_v2.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          idmap_pull_v2.py - re-run of the identifier map for companies v1 could not resolve (LEI -> ISIN -> ticker).
+
+          Standard library only. Free public sources:
+            GLEIF  (api.gleif.org)      legal name, jurisdiction, and ISINs linked to each LEI (coverage is incomplete)
+            OpenFIGI (api.openfigi.com) ISIN -> ticker, exchange, FIGI (mapping); company name -> listings (search)
+          Optional: set env OPENFIGI_KEY (free key from openfigi.com) for faster rate limits. Works without it.
+
+          Changes from v1:
+            1. ISINs are ordered with home prefixes first (filing country, GLEIF legal jurisdiction, headquarters country), cap 40.
+            2. Rows that are rights, interim/new-share lines (-RTS, -BTA, -NV24), ADR/GDR/unsponsored lines or bonds are rejected
+               as the main security.
+            3. Fallback when GLEIF has no usable ISIN: OpenFIGI name search for the Common Stock on the home exchange.
+               Such rows get method = name_search, an empty ISIN, and a note; they are matched on name similarity (>= 0.5).
+
+          Usage: python idmap_pull_v2.py --leis leis_fix.csv --chunk 1 --of 6 --out out
+          Output per chunk: id_map_<n>.csv (same columns as v1 plus method), id_all_figi_<n>.csv, idmap_<n>_log.txt
+          """
+          import argparse, csv, json, os, re, sys, time
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import quote
+
+          UA = "KAIM-Research-ID-map (research use)"
+          KEY = os.environ.get("OPENFIGI_KEY", "").strip()
+          HOME_EXCH = {"FR": "FP", "SE": "SS", "GB": "LN", "NL": "NA", "DK": "DC", "FI": "FH", "NO": "NO", "BE": "BB", "AT": "AV",
+                       "IT": "IM", "ES": "SM", "GR": "GA", "PL": "PW", "HU": "HB", "IS": "IR", "LU": "LX", "DE": "GR", "IE": "ID"}
+          FIELDS = ["lei", "country", "name", "gleif_name", "isin", "ticker", "exch_code", "figi", "security_type", "name_figi",
+                    "confidence", "n_isins", "n_checked", "notes", "method"]
+          BAD = re.compile(r"(-RTS|-BTA|-NV\d|-NR|-UNSP|-SPON|\bADR\b|\bGDR\b|\bDRIP\b|-RIGHTS|\bRTS\b|\bPRF\b|\bPREF)", re.I)
+          SUFFIX = re.compile(r"\b(a/s|aps|ab|abp|asa|as|oyj|oy|plc|ltd|limited|nv|n\.v\.|se|sa|s\.a\.|spa|s\.p\.a\.|ag|gmbh|kgaa|holding|holdings|group|"
+                              r"aktiebolag|aktiengesellschaft|publ|nyilvanosan|mukodo|rt|corp|corporation|company|co|the|inc|hf|bv|b\.v\.)\b", re.I)
+
+
+          def http(url, log, data=None, tries=5, headers=None):
+              delay = 3.0
+              for i in range(tries):
+                  try:
+                      h = {"User-Agent": UA, "Accept": "application/json"}
+                      if data is not None:
+                          h["Content-Type"] = "application/json"
+                      if KEY and "openfigi" in url:
+                          h["X-OPENFIGI-APIKEY"] = KEY
+                      if headers:
+                          h.update(headers)
+                      with urlopen(Request(url, data=data, headers=h), timeout=90) as r:
+                          return json.loads(r.read())
+                  except HTTPError as e:
+                      log.write("HTTP %s %s\n" % (e.code, url[:140]))
+                      if e.code in (400, 404):
+                          return None
+                      if e.code == 429:
+                          time.sleep(max(delay, 30)); delay *= 2; continue
+                  except (URLError, TimeoutError, ConnectionError, ValueError) as e:
+                      log.write("ERR %s %s\n" % (e, url[:140]))
+                  time.sleep(delay); delay *= 2
+              return None
+
+
+          def gleif(lei, log, max_isins):
+              rec = http("https://api.gleif.org/api/v1/lei-records/%s" % quote(lei), log)
+              name, countries = "", []
+              if rec and rec.get("data"):
+                  ent = (rec["data"].get("attributes") or {}).get("entity") or {}
+                  name = (ent.get("legalName") or {}).get("name", "")
+                  for k in ("jurisdiction", "legalAddress", "headquartersAddress"):
+                      v = ent.get(k)
+                      c = (v.get("country") if isinstance(v, dict) else v) or ""
+                      if c: countries.append(str(c)[:2].upper())
+              isins, page = [], 1
+              while True:
+                  d = http("https://api.gleif.org/api/v1/lei-records/%s/isins?page%%5Bsize%%5D=200&page%%5Bnumber%%5D=%d" % (quote(lei), page), log)
+                  if not d or not d.get("data"):
+                      break
+                  isins += [x["attributes"]["isin"] for x in d["data"] if x.get("attributes", {}).get("isin")]
+                  last = ((d.get("meta") or {}).get("pagination") or {}).get("lastPage", 1)
+                  if page >= last or len(isins) >= 1000:
+                      break
+                  page += 1
+                  time.sleep(1.1)
+              return name, countries, isins
+
+
+          def order_isins(isins, prefixes):
+              seen, out = set(), []
+              for p in prefixes:
+                  for i in isins:
+                      if i[:2] == p and i not in seen:
+                          seen.add(i); out.append(i)
+              return out + [i for i in isins if i not in seen]
+
+
+          def parse_figi(resp, isins):
+              rows = []
+              for isin, item in zip(isins, resp or []):
+                  for d in (item or {}).get("data", []) or []:
+                      rows.append({"isin": isin, "ticker": d.get("ticker", ""), "exch_code": d.get("exchCode", ""), "figi": d.get("figi", ""),
+                                   "security_type": d.get("securityType2") or d.get("securityType", ""), "name_figi": d.get("name", "")})
+              return rows
+
+
+          def figi(isins, log):
+              out, step = [], (100 if KEY else 10)
+              for i in range(0, len(isins), step):
+                  part = isins[i:i + step]
+                  resp = http("https://api.openfigi.com/v3/mapping", log, data=json.dumps([{"idType": "ID_ISIN", "idValue": x} for x in part]).encode())
+                  out += parse_figi(resp, part)
+                  time.sleep(0.8 if KEY else 2.6)
+              return out
+
+
+          def good(r):
+              return r["security_type"] == "Common Stock" and not BAD.search(r["name_figi"] or "")
+
+
+          def choose(rows, home_prefixes, country):
+              cs = [r for r in rows if good(r)]
+              home = HOME_EXCH.get(country, "")
+              for r in cs:
+                  if r["exch_code"] == home and r["isin"][:2] in home_prefixes:
+                      return r, "high"
+              for r in cs:
+                  if r["exch_code"] == home:
+                      return r, "high"
+              if cs:
+                  return cs[0], "medium"
+              return None, ""
+
+
+          def clean(n):
+              n = re.sub(r"[^\w\s/]", " ", (n or "").lower().replace("&", " and "))
+              n = SUFFIX.sub(" ", n)
+              return [t for t in n.replace("/", " ").split() if len(t) > 1 and t not in ("shs", "share", "shares", "class", "ser", "series", "reg", "ord")]
+
+
+          def score(a, b):
+              A, B = set(clean(a)), set(clean(b))
+              return len(A & B) / len(A | B) if A and B else 0.0
+
+
+          def name_search(names, country, log):
+              """Return (row, confidence) from OpenFIGI search by name; None when nothing similar enough."""
+              home = HOME_EXCH.get(country, "")
+              pause = 3.0 if KEY else 13.0
+              for exch, conf, floor in ((home, "medium", 0.5), ("", "low", 0.6)):
+                  for q in names:
+                      if not q:
+                          continue
+                      body = {"query": q, "securityType2": "Common Stock"}
+                      if exch:
+                          body["exchCode"] = exch
+                      d = http("https://api.openfigi.com/v3/search", log, data=json.dumps(body).encode())
+                      time.sleep(pause)
+                      best = None
+                      for x in (d or {}).get("data", []) or []:
+                          row = {"isin": "", "ticker": x.get("ticker", ""), "exch_code": x.get("exchCode", ""), "figi": x.get("figi", ""),
+                                 "security_type": x.get("securityType2") or x.get("securityType", ""), "name_figi": x.get("name", "")}
+                          if not good(row):
+                              continue
+                          s = score(q, row["name_figi"])
+                          if s >= floor and (best is None or s > best[0]):
+                              best = (s, row)
+                      if best:
+                          return best[1], conf, best[0]
+              return None, "", 0.0
+
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--leis", required=True); ap.add_argument("--chunk", type=int, default=1); ap.add_argument("--of", type=int, default=1)
+              ap.add_argument("--out", default="idmap_out"); ap.add_argument("--max-isins", type=int, default=40)
+              a = ap.parse_args()
+              os.makedirs(a.out, exist_ok=True)
+              todo = list(csv.DictReader(open(a.leis, encoding="utf-8")))
+              todo = [r for i, r in enumerate(todo) if i % a.of == a.chunk - 1]
+              log = open(os.path.join(a.out, "idmap_%d_log.txt" % a.chunk), "w")
+              fo = open(os.path.join(a.out, "id_map_%d.csv" % a.chunk), "w", newline="", encoding="utf-8")
+              fa = open(os.path.join(a.out, "id_all_figi_%d.csv" % a.chunk), "w", newline="", encoding="utf-8")
+              w = csv.DictWriter(fo, fieldnames=FIELDS); w.writeheader()
+              wa = csv.DictWriter(fa, fieldnames=["lei", "isin", "ticker", "exch_code", "figi", "security_type", "name_figi"]); wa.writeheader()
+              for n, r in enumerate(todo, 1):
+                  lei, ctry = r["lei"], r["country"]
+                  gname, gcountries, isins = gleif(lei, log, a.max_isins)
+                  prefixes = []
+                  for p in [ctry] + gcountries:
+                      if p and p not in prefixes: prefixes.append(p)
+                  ordered = order_isins(isins, prefixes)[: a.max_isins]
+                  rows = figi(ordered, log) if ordered else []
+                  for x in rows:
+                      wa.writerow({"lei": lei, **x})
+                  pick, conf = choose(rows, prefixes, ctry)
+                  method, notes = "gleif_isin", []
+                  if not isins: notes.append("no ISIN on GLEIF")
+                  if len(isins) > a.max_isins: notes.append("ISINs checked: %d of %d, home prefixes first" % (a.max_isins, len(isins)))
+                  if isins and not rows: notes.append("ISINs found but no FIGI match")
+                  if pick is None:
+                      pick, conf, sc = name_search([r["name"], gname], ctry, log)
+                      if pick:
+                          method = "name_search"
+                          notes.append("matched by name (similarity %.2f), ISIN not available from GLEIF; verify before use" % sc)
+                          wa.writerow({"lei": lei, **pick})
+                      else:
+                          method = ""
+                          notes.append("no listed common stock found")
+                  w.writerow({"lei": lei, "country": ctry, "name": r["name"], "gleif_name": gname,
+                              "isin": pick["isin"] if pick else "", "ticker": pick["ticker"] if pick else "",
+                              "exch_code": pick["exch_code"] if pick else "", "figi": pick["figi"] if pick else "",
+                              "security_type": pick["security_type"] if pick else "", "name_figi": pick["name_figi"] if pick else "",
+                              "confidence": conf, "n_isins": len(isins), "n_checked": len(ordered), "notes": "; ".join(notes), "method": method})
+                  fo.flush(); fa.flush()
+                  if n % 5 == 0:
+                      print("chunk %d: %d/%d" % (a.chunk, n, len(todo)), flush=True)
+              print("chunk %d done: %d companies" % (a.chunk, len(todo)))
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+          cat > idmap/leis_fix.csv <<'LEIEOF'
+          lei,country,name,ccy
+          894500GOC2F65II74F08,DK,ADFORM A/S,EUR
+          213800ATZVDWWKJ8NI47,DK,ASETEK A/S,USD
+          5493007I2KABJNYPD639,DK,DANFOSS A/S,EUR
+          213800M9GGJ3GNKQOC39,DK,SITECORE HOLDING III A/S,EUR
+          2138001F77YN7UTCOE28,DK,WILLIAM DEMANT INVEST A/S,DKK
+          636700Z25ZQXLMZ3CY73,FI,Kalmar Oyj,EUR
+          743700JHE9365SIHRE72,FI,Purmo Group Oyj,EUR
+          743700ATXLT0MFCHXT16,FI,WithSecure Oyj,EUR
+          969500JJRU82J0JMV072,FR,BALYO,EUR
+          213800XHATUM2LFMKG16,GB,AVEVA GROUP PLC,GBP
+          2138005SRWT4998BCE35,GB,OXFORD CANNABINOID TECHNOLOGIES HOLDINGS PLC,GBP
+          MINO79WLOO247M1IL051,NL,AIRBUS SE,EUR
+          549300WGC2HZ5J67V817,NL,CNH Industrial N.V.,USD
+          549300PVPZO8TNT76B58,SE,Calliditas Therapeutics AB,SEK
+          5493002G9GMTKIP3PW19,SE,Concentric AB,SEK
+          21380029O1RSZIAVOR95,BE,UCB BIOPHARMA,EUR
+          894500E4VTG4S81Y1881,DK,AKI Therapeutics A/S,DKK
+          52990077KVK7QCK2NG31,DK,LEO Pharma A/S,DKK
+          529900UTAHSVRYZL0380,DK,Novo Nordisk Fonden,DKK
+          894500WXW7NUVQF4I210,DK,SITEIMPROVE A/S,USD
+          549300FM1G5Q7DY0FQ65,DK,WS Audiology A/S,EUR
+          743700ULKFAAEA2N3D13,FI,Basware Oyj,EUR
+          549300R0VN9C371W0E07,FI,METSO OYJ,EUR
+          74370083282NHIP4QD02,FI,Raisio Oyj,EUR
+          549300NXL2KSHKJXTU29,GB,ACG METALS LIMITED,USD
+          X57JK1U580XATGR67572,GB,ROLLS-ROYCE PLC,GBP
+          5493004YF5D7Z612Z822,SE,Fingerprint Cards AB,SEK
+          54930033BTSY61VHUR49,SE,Haldex Aktiebolag,SEK
+          549300QTCWQBH6VIRT19,SE,Swedish Electromagnet Invest AB (publ),SEK
+          549300TAT2TADBW0WR70,AT,BOREALIS AG,EUR
+          529900YBFN87N63PFT67,AT,Pierer Industrie AG,EUR
+          2138003JHUE8O8Z9AW36,DK,ELLAB A/S,DKK
+          254900JH964PYU6MC463,DK,LUNDBECKFONDEN,DKK
+          254900EFJQOP8MJY7P44,DK,Oterra Holding ApS,EUR
+          9845006BFDJF0375E466,FI,F-Secure Oyj,EUR
+          2138007FRMWVPUDCMA45,FI,NELES OYJ,EUR
+          7437007N96FK4N3WHT09,FI,SSH Communications Security Oyj,EUR
+          213800YB4G7YN21NLL72,GB,ALLIED MINDS PLC,USD
+          213800I7RWQ3FV72EZ26,GB,XP POWER LIMITED,GBP
+          222100DCZBOWV5DZ8372,LU,ALVOTECH,USD
+          724500SNT1MK246AHP04,NL,Koninklijke DSM N.V.,EUR
+          21380068P1DRHMJ8KU70,NL,SHELL PLC,USD
+          213800MC2SGVSIBN7J53,NO,5TH PLANET GAMES A/S,DKK
+          213800LTM5FFHVRLNM97,NO,Meltwater N.V.,USD
+          529900I5MSNU451FL670,SE,Elos Medtech AB,SEK
+          549300LJ5CCWDPTK9Z08,SE,Orexo AB,SEK
+          39120001KULK7200U106,AT,Bundesanzeiger Verlag GmbH,EUR
+          213800ZFR2RIVOXEKP28,DK,BITTEN OG MADS CLAUSENS FOND,DKK
+          549300CD4NK2BVJ4VL20,DK,NORDIC BIOSCIENCE HOLDING A/S,DKK
+          984500981D136F0C7018,DK,T&W Medical A/S,DKK
+          743700BKTW4EQIVKYY42,FI,Fiskars Oyj Abp,EUR
+          549300A0JPRWG1KI7U06,FI,Nokia Oyj,EUR
+          743700Z1BNFYR9PRDF52,FI,Suominen Oyj,EUR
+          96950004ZQHLJ6V8PJ87,FR,IPSEN PHARMA,EUR
+          549300E9PC51EN656011,FR,SANOFI,EUR
+          213800V3NCQTY7IED471,GB,INDIVIOR PLC,USD
+          213800FLQUB9J289RU66,GB,"באטמ תקשורת מתקדמת בע""מ",USD
+          2221003P54KEDC3P4Z33,LU,BENEVOLENTAI,GBP
+          724500XYIJUGXAA5QD70,NL,Akzo Nobel N.V.,EUR
+          PY6ZZQWO2IZFZC3IOL08,SE,ASTRAZENECA PLC,USD
+          549300WJFW6ILNI4TA80,SE,Hexagon Aktiebolag,EUR
+          699400FG6E2AD50YHF38,BE,Galapagos SRP 2021,EUR
+          254900LLIROXU0TDYG54,BE,"פייטון פלאנר מגנטיקס בע""מ",USD
+          549300MKPW8ZF3E8MW37,DK,CHR. HANSEN HOLDING A/S,EUR
+          52990007PTGDTY54X103,DK,GRUNDFOS HOLDING A/S,DKK
+          5493004IM45YLQPU2R19,DK,ResoTher Pharma A/S,DKK
+          5299000CU2DGFP8LJ124,DK,UNION therapeutics A/S,DKK
+          5493002B0GOVF42KWX33,FI,Hiab Oyj,EUR
+          74370029VAHCXDR7B745,FI,Orion Oyj,EUR
+          743700RNDD7KU11HW873,FI,Vaisala Oyj,EUR
+          549300SOSI58J6VIW052,FR,COMPAGNIE GENERALE DES ETABLISSEMENTS MICHELIN,EUR
+          9695008N1821311KX668,FR,EKINOPS FRANCE,EUR
+          969500E35QZFDE7TVG55,FR,PLASTIC OMNIUM,EUR
+          213800HRE3FQJ6RK4H10,GB,ARGENT BIOPHARMA LIMITED,AUD
+          213800J4UVB5OWG8VX82,GB,DECHRA PHARMACEUTICALS PLC,GBP
+          549300J6ZJW5IH4WEE46,HU,RICHTER GEDEON VEGYÉSZETI GYÁR NYILVÁNOSAN MŰKÖDŐ RT.,HUF
+          549300RY7FWEMUOTIT28,LU,Quant AB,EUR
+          213800T66DRTE6O6BV87,NO,PGS ASA,USD
+          549300O897ZC5H7CY412,SE,Nordic Legal Entity Identifier AB,SEK
+          5493004CJOCT273MU397,SE,PROBI Aktiebolag,SEK
+          894500JU9WRAJQOVBI12,SE,SKF Group,SEK
+          213800SLDKXWKT6E3381,BE,ACACIA PHARMA GROUP PLC,USD
+          549300WXD34E8PPO0887,DK,3SHAPE HOLDING A/S,DKK
+          5299000WVEJNSG42AK88,DK,SIMCORP A/S,EUR
+          5493007050SJVMXN6L29,FI,Huhtamäki Oyj,EUR
+          5493009YRUJJDCFF0R80,FI,Outokumpu Oyj,EUR
+          743700P8A4M2MREWN035,FI,Valoe Oyj,EUR
+          969500SHQITWXSIS7N89,FR,UNIBAIL-RODAMCO-WESTFIELD SE,EUR
+          213800IR8G8LCZH4BO27,GB,AVAST PLC,USD
+          5299008YTLEN09WTHW26,IS,Marel hf.,EUR
+          213800C9JTKV8DLW6403,LU,SUSE S.A.,USD
+          529900SR87NBUKX74L58,SE,Biotage AB,SEK
+          549300MN30TBRLYN3465,SE,HEXPOL AB,SEK
+          549300EKKVQN2J25MJ59,SE,IRRAS AB,SEK
+          549300EXME8QXBXILE44,SE,MultiQ International Aktiebolag,SEK
+          5493000T8MZ5GQREJW94,SE,Nordic Waterproofing Holding AB,SEK
+          LEIEOF
+          python3 -m py_compile idmap/idmap_pull_v2.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: idmap2-inputs
+          path: idmap/
+
+  pull:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: [1, 2, 3, 4, 5, 6]
+    env:
+      OPENFIGI_KEY: ${{ secrets.OPENFIGI_KEY }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: idmap2-inputs
+          path: idmap
+      - name: Pull chunk ${{ matrix.chunk }} of 6
+        run: python idmap/idmap_pull_v2.py --leis idmap/leis_fix.csv --chunk ${{ matrix.chunk }} --of 6 --out out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: idmap2-chunk-${{ matrix.chunk }}
+          path: out/
+          if-no-files-found: ignore
+
+  combine:
+    needs: pull
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: idmap2-chunk-*
+          merge-multiple: true
+          path: all
+      - name: Stack chunks
+        run: |
+          cd all
+          first=$(ls id_map_*.csv | head -1)
+          head -1 "$first" > id_map.csv
+          for f in id_map_*.csv; do tail -n +2 "$f" >> id_map.csv; done
+          head -1 "$(ls id_all_figi_*.csv | head -1)" > id_all_figi.csv
+          for f in id_all_figi_*.csv; do tail -n +2 "$f" >> id_all_figi.csv; done
+          wc -l id_map.csv id_all_figi.csv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: id-map-v2
+          path: |
+            all/id_map.csv
+            all/id_all_figi.csv
+            all/idmap_*_log.txt
 
