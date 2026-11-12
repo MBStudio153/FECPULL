@@ -1,1 +1,65 @@
+name: rma-loss-data2
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  rma:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        range: ["1989-1996", "1997-2004", "2005-2012", "2013-2020", "2021-2026"]
+    steps:
+      - name: RMA Cause of Loss Summary of Business, indemnities by cause, state and commodity
+        env:
+          RANGE: ${{ matrix.range }}
+        run: |
+          mkdir -p out zips
+          cat > agg.py <<'PY'
+          import collections, csv, io, json, os, subprocess, zipfile
+          y0, y1 = [int(x) for x in os.environ["RANGE"].split("-")]
+          base = "https://pubfs-rma.fpac.usda.gov/pub/Web_Data_Files/Summary_of_Business/cause_of_loss/colsom_%d.zip"
+          log = open("out/log.txt", "w")
+          # key -> [indemnity, liability, policies_indemnified, determined_qty]
+          by_state = collections.defaultdict(lambda: [0, 0, 0, 0.0])
+          by_comm = collections.defaultdict(lambda: [0, 0, 0, 0.0])
+          by_month = collections.defaultdict(lambda: [0, 0, 0, 0.0])
+          for yr in range(y0, y1 + 1):
+              zp = "zips/%d.zip" % yr
+              r = subprocess.run(["curl", "-sSL", "-A", "Mozilla/5.0 kaim-research", "-m", "900", "-o", zp, "-w", "%{http_code}", base % yr], capture_output=True, text=True)
+              log.write("%d http %s %s\n" % (yr, r.stdout, r.stderr[:200])); log.flush()
+              try:
+                  z = zipfile.ZipFile(zp)
+              except Exception as e:
+                  log.write("%d bad zip %r\n" % (yr, e)); continue
+              n = 0; shown = 0; badn = 0
+              for name in z.namelist():
+                  with z.open(name) as fh:
+                      for line in io.TextIOWrapper(fh, encoding="latin-1"):
+                          if shown < 4:
+                              log.write("SAMPLE %d %s: %r\n" % (yr, name, line[:600])); shown += 1
+                          f = line.rstrip("\n").split("|")
+                          if len(f) < 29 or not f[0].strip().isdigit():
+                              badn += 1; continue
+                          try:
+                              cy = int(f[0]); ly = int(f[15]); ind = int(f[28]); liab = int(f[20] or 0); pol = int(f[17] or 0); dq = float(f[27] or 0)
+                          except Exception:
+                              continue
+                          cause = f[12].strip(); st = f[2].strip(); com = f[6].strip(); mo = int(f[13] or 0)
+                          for d, k in ((by_state, (cy, ly, st, cause)), (by_comm, (cy, ly, com, cause)), (by_month, (cy, ly, mo, cause))):
+                              v = d[k]; v[0] += ind; v[1] += liab; v[2] += pol; v[3] += dq
+                          n += 1
+              log.write("%d: %d records, %d lines skipped, files %s\n" % (yr, n, badn, z.namelist())); log.flush()
+              os.remove(zp)
+          for nm, d in (("by_state_cause", by_state), ("by_commodity_cause", by_comm), ("by_month_cause", by_month)):
+              json.dump([list(k) + v for k, v in d.items()], open("out/rma_%s_%d_%d.json" % (nm, y0, y1), "w"))
+              log.write("%s: %d keys\n" % (nm, len(d)))
+          PY
+          python3 agg.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rma-loss2-${{ matrix.range }}
+          path: out/
 
