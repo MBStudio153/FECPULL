@@ -1,1 +1,25 @@
+name: nri-soil-data1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  nri:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download NRCS 2022 NRI Summary Report and extract state tables
+        run: |
+          mkdir -p out
+          sudo apt-get install -y poppler-utils >/dev/null 2>&1 || true
+          curl -fsSL -A "kaim-research/1.0" -o out/nri2022.pdf "https://nrcs-prod.azureedge.us/sites/default/files/2026-02/2022%20NRI%20Summary%20Report.pdf" || echo "pdf download failed" >> out/log.txt
+          if [ -f out/nri2022.pdf ]; then
+            pdftotext -layout out/nri2022.pdf out/nri2022_layout.txt
+            grep -n -E "^ *Table (2|10|12|14|15|16|17|18)[ ,.:a]" out/nri2022_layout.txt > out/table_index.txt || true
+            wc -l out/nri2022_layout.txt >> out/log.txt
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nri-soil-2022
+          path: out/
 
