@@ -1,1 +1,86 @@
+name: nass-loss-data2
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  crops:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: NASS Quick Stats bulk crops file, filtered to planted, harvested and yield (national and state)
+        run: |
+          mkdir -p out
+          B=""
+          for base in "https://ftp.nass.usda.gov/quickstats/" "https://www.nass.usda.gov/datasets/"; do
+            curl -sSL -A "Mozilla/5.0 (X11; Linux x86_64) kaim-research" -o out/listing.html -w "%{http_code} $base\n" "$base" >> out/log.txt 2>&1 || echo "curl error on $base" >> out/log.txt
+            grep -o 'qs\.crops_[0-9]*\.txt\.gz' out/listing.html | sort -u > out/crops_links.txt || true
+            if [ -s out/crops_links.txt ]; then B="$base"; break; fi
+          done
+          cat out/crops_links.txt >> out/log.txt
+          f=$(tail -1 out/crops_links.txt)
+          if [ -z "$f" ]; then echo "no crops file found" >> out/log.txt; head -c 600 out/listing.html >> out/log.txt; exit 0; fi
+          curl -fSL -A "Mozilla/5.0 (X11; Linux x86_64) kaim-research" -o crops.gz "$B$f" || { echo "download failed $B$f" >> out/log.txt; exit 0; }
+          ls -la crops.gz >> out/log.txt
+          cat > f.py <<'PY'
+          import csv, gzip, sys
+          csv.field_size_limit(10**9)
+          com = {"CORN","SOYBEANS","WHEAT","COTTON","SORGHUM","HAY","BARLEY","OATS","RICE","PEANUTS","SUGARBEETS","POTATOES","TOBACCO"}
+          stat = {"AREA PLANTED","AREA HARVESTED","YIELD","PRODUCTION"}
+          keep = ["COMMODITY_DESC","CLASS_DESC","PRODN_PRACTICE_DESC","UTIL_PRACTICE_DESC","STATISTICCAT_DESC","UNIT_DESC","SHORT_DESC","AGG_LEVEL_DESC","STATE_ALPHA","FREQ_DESC","REFERENCE_PERIOD_DESC","YEAR","VALUE"]
+          n = 0
+          with gzip.open("crops.gz", "rt", encoding="utf-8", errors="replace") as fh, open("out/nass_crops_filtered.tsv", "w", newline="") as oh:
+              r = csv.DictReader(fh, delimiter="\t")
+              w = csv.writer(oh, delimiter="\t"); w.writerow(keep)
+              for row in r:
+                  if row["SOURCE_DESC"] != "SURVEY" or row["FREQ_DESC"] != "ANNUAL": continue
+                  if row["AGG_LEVEL_DESC"] not in ("NATIONAL", "STATE"): continue
+                  if row["COMMODITY_DESC"] not in com or row["STATISTICCAT_DESC"] not in stat: continue
+                  if row["DOMAIN_DESC"] != "TOTAL": continue
+                  w.writerow([row[k] for k in keep]); n += 1
+          print(n, "rows kept")
+          PY
+          python3 f.py >> out/log.txt 2>&1
+          ls -la out >> out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nass-crops-loss2
+          path: out/
+  animals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: NASS Quick Stats bulk animals file, filtered to death loss and weather rows
+        run: |
+          mkdir -p out
+          B=""
+          for base in "https://ftp.nass.usda.gov/quickstats/" "https://www.nass.usda.gov/datasets/"; do
+            curl -sSL -A "Mozilla/5.0 (X11; Linux x86_64) kaim-research" -o out/listing.html -w "%{http_code} $base\n" "$base" >> out/log.txt 2>&1 || echo "curl error on $base" >> out/log.txt
+            grep -o 'qs\.animals_products_[0-9]*\.txt\.gz' out/listing.html | sort -u > out/animals_products_links.txt || true
+            if [ -s out/animals_products_links.txt ]; then B="$base"; break; fi
+          done
+          cat out/animals_products_links.txt >> out/log.txt
+          f=$(tail -1 out/animals_products_links.txt)
+          if [ -z "$f" ]; then echo "no animals_products file found" >> out/log.txt; head -c 600 out/listing.html >> out/log.txt; exit 0; fi
+          curl -fSL -A "Mozilla/5.0 (X11; Linux x86_64) kaim-research" -o an.gz "$B$f" || { echo "download failed $B$f" >> out/log.txt; exit 0; }
+          ls -la an.gz >> out/log.txt
+          cat > f.py <<'PY'
+          import csv, gzip
+          csv.field_size_limit(10**9)
+          n = 0
+          with gzip.open("an.gz", "rt", encoding="utf-8", errors="replace") as fh, open("out/nass_animals_loss.tsv", "w", newline="") as oh:
+              r = csv.DictReader(fh, delimiter="\t")
+              w = csv.writer(oh, delimiter="\t"); w.writerow(r.fieldnames)
+              for row in r:
+                  s = (row["SHORT_DESC"] + " " + row["DOMAINCAT_DESC"] + " " + row["STATISTICCAT_DESC"]).upper()
+                  if "DEATH" in s or "LOSS" in s or "LOST" in s or "MORTALITY" in s:
+                      w.writerow([row[k] for k in r.fieldnames]); n += 1
+          print(n, "rows kept")
+          PY
+          python3 f.py >> out/log.txt 2>&1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nass-animals-loss2
+          path: out/
 
