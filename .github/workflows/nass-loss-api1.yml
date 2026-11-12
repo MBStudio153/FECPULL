@@ -1,1 +1,89 @@
+name: nass-loss-api1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  crops:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        commodity: [CORN, SOYBEANS, WHEAT, COTTON, SORGHUM, HAY, BARLEY, RICE]
+    steps:
+      - name: NASS Quick Stats API, planted, harvested and yield, national and state, 1950 on
+        env:
+          NASS_KEY: ${{ secrets.NASS_API_KEY }}
+          COMMODITY: ${{ matrix.commodity }}
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, os, time, urllib.parse, urllib.request
+          key = os.environ["NASS_KEY"]; com = os.environ["COMMODITY"]
+          keep = ["commodity_desc","class_desc","prodn_practice_desc","util_practice_desc","statisticcat_desc","unit_desc","short_desc","agg_level_desc","state_alpha","freq_desc","reference_period_desc","year","Value"]
+          log = open("out/log.txt", "w"); rows = []
+          if not key: log.write("NASS_API_KEY secret is empty\n")
+          for stat in ("AREA PLANTED", "AREA HARVESTED", "YIELD"):
+              for lvl in ("NATIONAL", "STATE"):
+                  q = {"key": key, "source_desc": "SURVEY", "commodity_desc": com, "statisticcat_desc": stat, "agg_level_desc": lvl,
+                       "freq_desc": "ANNUAL", "domain_desc": "TOTAL", "year__GE": "1950", "format": "JSON"}
+                  url = "https://quickstats.nass.usda.gov/api/api_GET/?" + urllib.parse.urlencode(q)
+                  for a in range(4):
+                      try:
+                          d = json.loads(urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "kaim-research/1.0"}), timeout=120).read().decode())
+                          got = d.get("data", [])
+                          rows += [{k: r.get(k) for k in keep} for r in got]
+                          log.write("%s %s %s: %d rows\n" % (com, stat, lvl, len(got))); log.flush(); break
+                      except Exception as e:
+                          log.write("%s %s %s attempt %d %r\n" % (com, stat, lvl, a, e)); log.flush(); time.sleep(8)
+                  time.sleep(1)
+          json.dump(rows, open("out/nass_%s.json" % com.lower(), "w"))
+          log.write("total %d rows\n" % len(rows))
+          PY
+          python3 q.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nass-api-crop-${{ matrix.commodity }}
+          path: out/
+  animals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: NASS Quick Stats API, livestock death loss and related rows, national and state, 1950 on
+        env:
+          NASS_KEY: ${{ secrets.NASS_API_KEY }}
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, os, time, urllib.parse, urllib.request
+          key = os.environ["NASS_KEY"]
+          log = open("out/log.txt", "w"); rows = []
+          if not key: log.write("NASS_API_KEY secret is empty\n")
+          def get(q):
+              url = "https://quickstats.nass.usda.gov/api/api_GET/?" + urllib.parse.urlencode(q)
+              for a in range(4):
+                  try:
+                      return json.loads(urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "kaim-research/1.0"}), timeout=120).read().decode()).get("data", [])
+                  except Exception as e:
+                      log.write("%r attempt %d %r\n" % (q.get("commodity_desc"), a, e)); log.flush(); time.sleep(8)
+              return []
+          for com in ("CATTLE", "SHEEP", "GOATS", "HOGS", "CHICKENS", "TURKEYS"):
+              for y0, y1 in ((1950, 1989), (1990, 2009), (2010, 2026)):
+                  q = {"key": key, "commodity_desc": com, "sector_desc": "ANIMALS & PRODUCTS", "freq_desc": "ANNUAL",
+                       "year__GE": str(y0), "year__LE": str(y1), "format": "JSON"}
+                  data = get(q)
+                  hit = [r for r in data if any(w in (r.get("short_desc", "") + " " + r.get("statisticcat_desc", "")).upper() for w in ("DEATH", "LOSS", "LOST", "MORTALITY"))]
+                  rows += hit
+                  log.write("%s %d-%d: %d rows, %d kept\n" % (com, y0, y1, len(data), len(hit))); log.flush()
+                  time.sleep(1)
+          json.dump(rows, open("out/nass_animals_loss.json", "w"))
+          log.write("total %d rows\n" % len(rows))
+          PY
+          python3 q.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nass-api-animals
+          path: out/
 
