@@ -1,1 +1,59 @@
+name: flocks-download2
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Use the dashboard's Download Data link and Crosstab export
+        run: |
+          mkdir -p out
+          pip install --quiet playwright
+          python3 -m playwright install --with-deps chromium > out/install.txt 2>&1 || true
+          cat > q.py <<'PY'
+          from playwright.sync_api import sync_playwright
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          URL = "https://publicdashboards.dl.usda.gov/t/MRP_PUB/views/VS_Avian_HPAIConfirmedDetections2022/HPAI2022ConfirmedDetections?:embed=y&:showVizHome=no&:toolbar=yes"
+          with sync_playwright() as p:
+              b = p.chromium.launch()
+              ctx = b.new_context(accept_downloads=True, viewport={"width": 1600, "height": 1300}, user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36")
+              pg = ctx.new_page(); pg.goto(URL, wait_until="domcontentloaded", timeout=180000); pg.wait_for_timeout(30000)
+              frames = [pg] + list(pg.frames)
+              # 1) the blue "Download Data" link in the dashboard header
+              for f in frames:
+                  for loc in f.get_by_text("Download Data").all():
+                      try:
+                          L("link: tag=%s href=%r" % (loc.evaluate("e => e.tagName"), loc.evaluate("e => e.href || (e.closest('a') && e.closest('a').href) || ''")))
+                      except Exception as e: L("link inspect err %r" % e)
+              saved = False
+              for f in frames:
+                  try:
+                      loc = f.get_by_text("Download Data").first
+                      if loc.count():
+                          try:
+                              with ctx.expect_page(timeout=15000) as np_:
+                                  loc.click()
+                              np = np_.value; np.wait_for_timeout(8000); L("new page url: %s" % np.url); np.screenshot(path="out/newpage.png"); L("new page text: %r" % np.inner_text("body")[:500])
+                          except Exception as e:
+                              L("no new page: %r" % e)
+                              try:
+                                  with pg.expect_download(timeout=60000) as dl: loc.click()
+                                  d = dl.value; d.save_as("out/" + d.suggested_filename); L("saved %s" % d.suggested_filename); saved = True
+                              except Exception as e2: L("no download: %r" % e2)
+                          break
+                  except Exception as e: L("click err %r" % e)
+              pg.screenshot(path="out/after_click.png", full_page=True)
+              for q in ctx.pages: L("page: %s" % q.url)
+              b.close()
+          PY
+          python3 q.py || true
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: flocks-download2
+          path: out/
 
