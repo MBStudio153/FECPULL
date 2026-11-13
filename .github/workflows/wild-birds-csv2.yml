@@ -1,1 +1,44 @@
+name: wild-birds-csv2
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Fetch the APHIS csv files from inside a loaded APHIS page, which the site allows
+        run: |
+          mkdir -p out
+          pip install --quiet playwright
+          python3 -m playwright install --with-deps chromium > out/install.txt 2>&1 || true
+          cat > q.py <<'PY'
+          from playwright.sync_api import sync_playwright
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          PAGE = "https://www.aphis.usda.gov/livestock-poultry-disease/avian/avian-influenza/hpai-detections/"
+          JS = "async (u) => { const r = await fetch(u); const t = await r.text(); return [r.status, t]; }"
+          jobs = {"wild-birds": ["hpai-wild-birds.csv"],
+                  "commercial-backyard-flocks": ["hpai-flocks.csv", "hpai-commercial-backyard-flocks.csv", "hpai-confirmed-flocks.csv", "hpai-commercial-flocks.csv", "hpai-backyard-flocks.csv"],
+                  "mammals": ["hpai-mammals.csv"]}
+          with sync_playwright() as p:
+              b = p.chromium.launch(); ctx = b.new_context(user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"); pg = ctx.new_page()
+              seen = []
+              pg.on("response", lambda r: seen.append((r.status, r.url)))
+              for slug, names in jobs.items():
+                  pg.goto(PAGE + slug, wait_until="networkidle", timeout=120000); pg.wait_for_timeout(10000)
+                  for n in names:
+                      s, t = pg.evaluate(JS, "/sites/default/files/" + n)
+                      L("%s %s -> %s %d chars, starts %r" % (slug, n, s, len(t), t[:80]))
+                      if s == 200 and "<html" not in t[:300].lower(): open("out/" + n, "w").write(t)
+              for s, u in seen:
+                  if u.endswith((".csv", ".xlsx", ".json")): L("NET %s %s" % (s, u))
+              b.close()
+          PY
+          python3 q.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wild-birds-csv2
+          path: out/
 
