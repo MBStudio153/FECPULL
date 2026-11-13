@@ -1,1 +1,63 @@
+name: species-loss-data2
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        job: [wild_render, flocks_csv, ecos]
+    steps:
+      - name: Render pages in a browser and fetch data files
+        env:
+          JOB: ${{ matrix.job }}
+        run: |
+          mkdir -p out
+          pip install --quiet playwright requests pandas lxml html5lib
+          python3 -m playwright install --with-deps chromium > out/install.txt 2>&1 || true
+          cat > q.py <<'PY'
+          import os, io, re, time, json, requests, pandas as pd
+          from playwright.sync_api import sync_playwright
+          job = os.environ["JOB"]; log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          H = {"User-Agent": "Mozilla/5.0 (compatible; kaim-research/1.0)"}
+          def render(url, name, scroll=True, wait=15000):
+              with sync_playwright() as p:
+                  b = p.chromium.launch(); pg = b.new_page(viewport={"width": 1400, "height": 1200})
+                  seen = []
+                  pg.on("response", lambda r: seen.append((r.status, r.request.resource_type, r.url[:300])))
+                  pg.goto(url, wait_until="networkidle", timeout=120000); pg.wait_for_timeout(wait)
+                  html = pg.content(); open("out/%s.html" % name, "w").write(html)
+                  for s, t, u in seen:
+                      if t in ("xhr", "fetch", "document") or re.search(r"json|csv|query|feature|tableau|vizql", u, re.I): L("NET %s %s %s" % (s, t, u))
+                  try:
+                      ts = pd.read_html(io.StringIO(html))
+                      for i, t in enumerate(ts): t.to_csv("out/%s_t%d.csv" % (name, i), index=False); L("%s table %d shape %s cols %s" % (name, i, t.shape, list(t.columns)[:10]))
+                  except Exception as e: L("%s no tables %r" % (name, e))
+                  b.close()
+          if job == "wild_render":
+              render("https://www.aphis.usda.gov/livestock-poultry-disease/avian/avian-influenza/hpai-detections/wild-birds", "wild", wait=25000)
+          elif job == "flocks_csv":
+              base = "https://publicdashboards.dl.usda.gov/t/MRP_PUB/views/VS_Avian_HPAIConfirmedDetections2022/HPAI2022ConfirmedDetections"
+              for suf, n in ((".csv", "v_csv"), (".csv?:showVizHome=no", "v_csv2"), ("?:format=csv", "v_fmt"), (".csv?:refresh=yes", "v_csv3")):
+                  try:
+                      r = requests.get(base + suf, headers=H, timeout=180)
+                      L("%s -> %s %d bytes type %s" % (base + suf, r.status_code, len(r.content), r.headers.get("content-type")))
+                      if r.ok and len(r.content) > 200: open("out/%s.csv" % n, "wb").write(r.content)
+                  except Exception as e: L("%s %r" % (suf, e))
+              render(base + "?:embed=y&:showVizHome=no&:toolbar=yes", "flocks_dash", wait=30000)
+          else:
+              for u, n in (("https://ecos.fws.gov/ecp/report/species-listings-by-year-totals", "totals"),
+                           ("https://ecos.fws.gov/ecp/report/boxscore", "boxscore")):
+                  render(u, n, wait=10000)
+          PY
+          python3 q.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: species-loss2-${{ matrix.job }}
+          path: out/
 
