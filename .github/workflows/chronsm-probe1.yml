@@ -1,1 +1,48 @@
+name: chronam-probe1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        span: ["1780-1839", "1840-1899", "1900-1963"]
+    steps:
+      - name: Count and sample newspaper hits for bread and milk prices by decade
+        env:
+          SPAN: ${{ matrix.span }}
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import os, json, time, urllib.request, urllib.parse
+          a, b = [int(x) for x in os.environ["SPAN"].split("-")]
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          QUERIES = ["bread price loaf cents", "milk price quart cents", "flour price barrel bread", "price of bread", "price of milk"]
+          res = []
+          for y in range(a, b + 1, 10):
+              y2 = min(y + 9, b)
+              for q in QUERIES:
+                  url = "https://www.loc.gov/collections/chronicling-america/?" + urllib.parse.urlencode({"q": q, "dates": "%d/%d" % (y, y2), "fo": "json", "c": 25})
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": "KAIM-Research-probe (info@kaimresearch.com)"})
+                      d = json.load(urllib.request.urlopen(req, timeout=60))
+                      n = d.get("pagination", {}).get("total")
+                      items = [{"date": r.get("date"), "title": r.get("title"), "url": r.get("id"), "snippet": (r.get("description") or [""])[0][:300] if isinstance(r.get("description"), list) else str(r.get("description"))[:300]} for r in d.get("results", [])[:25]]
+                      res.append({"decade": y, "query": q, "total": n, "items": items}); L("%d %s total=%s" % (y, q, n))
+                  except Exception as e:
+                      L("%d %s ERROR %r" % (y, q, e))
+                  time.sleep(4)
+          json.dump(res, open("out/probe.json", "w"), indent=1)
+          PY
+          python3 q.py || true
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chronam-probe1-${{ matrix.span }}
+          path: out/
 
