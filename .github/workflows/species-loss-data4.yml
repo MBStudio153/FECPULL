@@ -1,1 +1,44 @@
+name: species-loss-data4
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  ecos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Render the ECOS delisted species report and save its table and data requests
+        run: |
+          mkdir -p out
+          pip install --quiet playwright pandas lxml html5lib
+          python3 -m playwright install --with-deps chromium > out/install.txt 2>&1 || true
+          cat > q.py <<'PY'
+          import io, re, requests, pandas as pd
+          from playwright.sync_api import sync_playwright
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          with sync_playwright() as p:
+              b = p.chromium.launch(); pg = b.new_page(viewport={"width": 1500, "height": 1200}); seen = []
+              pg.on("response", lambda r: seen.append((r.status, r.url[:300])))
+              pg.goto("https://ecos.fws.gov/ecp/report/species-delisted", wait_until="networkidle", timeout=120000); pg.wait_for_timeout(15000)
+              html = pg.content(); open("out/delisted.html", "w").write(html)
+              for s, u in seen:
+                  if "ecp" in u and "assets" not in u: L("NET %s %s" % (s, u))
+              try:
+                  for i, t in enumerate(pd.read_html(io.StringIO(html))):
+                      t.to_csv("out/delisted_t%d.csv" % i, index=False); L("table %d shape %s cols %s" % (i, t.shape, list(t.columns)[:10]))
+              except Exception as e: L("no tables %r" % e)
+              b.close()
+          for u in ("https://ecos.fws.gov/ecp/report/speciesDelisted?format=json", "https://ecos.fws.gov/ecp/report/species-delisted?format=json"):
+              try:
+                  r = requests.get(u, headers={"User-Agent": "Mozilla/5.0"}, timeout=60); L("%s -> %s %d" % (u, r.status_code, len(r.content)))
+                  if r.ok: open("out/delisted_%d.json" % abs(hash(u) % 1000), "wb").write(r.content)
+              except Exception as e: L("%s %r" % (u, e))
+          PY
+          python3 q.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: species-loss4-ecos
+          path: out/
 
