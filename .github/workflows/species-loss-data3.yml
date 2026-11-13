@@ -1,1 +1,70 @@
+name: species-loss-data3
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        job: [aphis_csv, ecos_reports]
+    steps:
+      - name: Download APHIS csv files and list ECOS reports
+        env:
+          JOB: ${{ matrix.job }}
+        run: |
+          mkdir -p out
+          pip install --quiet playwright requests
+          python3 -m playwright install --with-deps chromium > out/install.txt 2>&1 || true
+          cat > q.py <<'PY'
+          import os, re, requests
+          from playwright.sync_api import sync_playwright
+          job = os.environ["JOB"]; log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          H = {"User-Agent": "Mozilla/5.0 (compatible; kaim-research/1.0)"}
+          if job == "aphis_csv":
+              B = "https://www.aphis.usda.gov/sites/default/files/"
+              names = ["hpai-wild-birds.csv", "hpai-flocks.csv", "hpai-commercial-backyard-flocks.csv", "hpai-confirmed-flocks.csv",
+                       "hpai-mammals.csv", "hpai-livestock.csv", "hpai-detections-flocks.csv", "hpai-commercial-flocks.csv", "hpai-backyard-flocks.csv"]
+              for n in names:
+                  try:
+                      r = requests.get(B + n, headers=H, timeout=180)
+                      L("%s -> %s %d bytes %s" % (n, r.status_code, len(r.content), r.headers.get("content-type")))
+                      if r.ok and len(r.content) > 500 and b"<html" not in r.content[:300].lower(): open("out/" + n, "wb").write(r.content)
+                  except Exception as e: L("%s %r" % (n, e))
+              # also render the flocks page and log every csv/json the page requests
+              with sync_playwright() as p:
+                  b = p.chromium.launch(); pg = b.new_page()
+                  seen = []
+                  pg.on("response", lambda r: seen.append((r.status, r.url[:300])))
+                  for u in ("https://www.aphis.usda.gov/livestock-poultry-disease/avian/avian-influenza/hpai-detections/commercial-backyard-flocks",
+                            "https://www.aphis.usda.gov/livestock-poultry-disease/avian/avian-influenza/hpai-detections/mammals"):
+                      pg.goto(u, wait_until="networkidle", timeout=120000); pg.wait_for_timeout(20000)
+                      open("out/page_%d.html" % abs(hash(u) % 1000), "w").write(pg.content())
+                  for s, u in seen:
+                      if re.search(r"\.csv|\.json|\.xlsx|sites/default/files", u) and "css" not in u and ".js" not in u: L("NET %s %s" % (s, u))
+                  b.close()
+          else:
+              with sync_playwright() as p:
+                  b = p.chromium.launch(); pg = b.new_page(); seen = []
+                  pg.on("response", lambda r: seen.append((r.status, r.url[:300])))
+                  pg.goto("https://ecos.fws.gov/ecp/report/reports", wait_until="networkidle", timeout=120000); pg.wait_for_timeout(8000)
+                  html = pg.content(); open("out/reports.html", "w").write(html)
+                  L("links: " + "\n".join(sorted(set(re.findall(r'href="(/ecp/report/[^"]+)"', html)))))
+                  for s, u in seen:
+                      if "ecp" in u and "assets" not in u: L("NET %s %s" % (s, u))
+                  b.close()
+                  for n in ("delisted", "species-delisted", "delistings-by-year", "extinct-species", "species-delisted-extinction"):
+                      try:
+                          r = requests.get("https://ecos.fws.gov/ecp/report/" + n, headers=H, timeout=60); L("%s -> %s %d" % (n, r.status_code, len(r.content)))
+                      except Exception as e: L("%s %r" % (n, e))
+          PY
+          python3 q.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: species-loss3-${{ matrix.job }}
+          path: out/
 
