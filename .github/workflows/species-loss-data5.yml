@@ -1,1 +1,45 @@
+name: species-loss-data5
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  ecos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Save the full ECOS delisted species export, all taxa
+        run: |
+          mkdir -p out
+          pip install --quiet playwright requests
+          python3 -m playwright install --with-deps chromium > out/install.txt 2>&1 || true
+          cat > q.py <<'PY'
+          import re, requests
+          from playwright.sync_api import sync_playwright
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          urls = []
+          with sync_playwright() as p:
+              b = p.chromium.launch(); pg = b.new_page(viewport={"width": 1500, "height": 1200})
+              pg.on("response", lambda r: urls.append(r.url))
+              pg.goto("https://ecos.fws.gov/ecp/report/species-delisted", wait_until="networkidle", timeout=120000); pg.wait_for_timeout(15000)
+              b.close()
+          ex = [u for u in urls if "pullreports" in u]
+          for u in ex: L("FULL " + u)
+          H = {"User-Agent": "Mozilla/5.0"}
+          n = 0
+          for u in ex:
+              for extra in ("", "&format=csv", "&output=csv", "&format=json"):
+                  try:
+                      r = requests.get(u + extra, headers=H, timeout=120)
+                      L("%s -> %s %d bytes %s" % (extra or "(as is)", r.status_code, len(r.content), r.headers.get("content-type")))
+                      if r.ok and len(r.content) > 300:
+                          n += 1; open("out/export_%d.txt" % n, "wb").write(r.content)
+                  except Exception as e: L("%s %r" % (extra, e))
+          PY
+          python3 q.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: species-loss5-ecos
+          path: out/
 
