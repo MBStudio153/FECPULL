@@ -1,1 +1,44 @@
+name: vdem-data1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Read the V-Dem country-year data from the vdemdata package on GitHub
+        run: |
+          mkdir -p out
+          git clone --depth 1 https://github.com/vdeminstitute/vdemdata.git repo
+          ls -la repo repo/data | tee out/listing.txt
+          cp repo/DESCRIPTION out/DESCRIPTION.txt
+          pip install --quiet pyreadr pandas
+          cat > q.py <<'PY'
+          import glob, pyreadr, pandas as pd
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          files = glob.glob("repo/data/*.rda") + glob.glob("repo/data/*.RData")
+          L("files: %r" % files)
+          for f in files:
+              try:
+                  res = pyreadr.read_r(f)
+                  for name, df in res.items():
+                      L("%s: %s rows x %s cols" % (name, df.shape[0], df.shape[1]))
+                      if name == "vdem":
+                          keep = [c for c in df.columns if c in ("country_name", "country_text_id", "country_id", "year", "historical_date", "e_regionpol_6C", "e_pop", "e_gdppc") or c.startswith("v2x_") or c in ("v2xcl_rol", "v2x_regime")]
+                          df[keep].to_csv("out/vdem_country_year_v2x.csv", index=False)
+                          L("saved %d columns: %s" % (len(keep), ", ".join(keep)))
+                          us = df[df["country_text_id"] == "USA"][["year", "v2x_libdem", "v2x_polyarchy", "v2x_regime"]] if "v2x_libdem" in df else None
+                          if us is not None: L("USA tail:\n" + us.tail(8).to_string())
+              except Exception as e:
+                  L("%s failed %r" % (f, e))
+          PY
+          python3 q.py || true
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vdem-data
+          path: out/
 
