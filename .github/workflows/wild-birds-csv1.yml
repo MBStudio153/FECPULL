@@ -1,1 +1,19 @@
-
+name: wild-birds-csv1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - run: |
+          mkdir -p out
+          curl -L -sS -A "Mozilla/5.0" -o out/hpai-wild-birds.csv https://www.aphis.usda.gov/sites/default/files/hpai-wild-birds.csv
+          ls -la out
+          head -3 out/hpai-wild-birds.csv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wild-birds-csv
+          path: out/
