@@ -1,1 +1,72 @@
+name: species-loss-data1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        job: [ecos, aphis_flocks, aphis_wild]
+    steps:
+      - name: Fetch pages and tables for one source
+        env:
+          JOB: ${{ matrix.job }}
+        run: |
+          mkdir -p out
+          pip install --quiet pandas lxml beautifulsoup4 html5lib requests
+          cat > q.py <<'PY'
+          import os, io, time, requests, pandas as pd
+          job = os.environ["JOB"]
+          log = open("out/log.txt", "w")
+          H = {"User-Agent": "Mozilla/5.0 (compatible; kaim-research/1.0)"}
+          def get(url, name):
+              for a in range(3):
+                  try:
+                      r = requests.get(url, headers=H, timeout=120)
+                      log.write("%s -> %s %d bytes\n" % (url, r.status_code, len(r.content))); log.flush()
+                      if r.ok:
+                          open("out/%s.html" % name, "wb").write(r.content); return r.text
+                  except Exception as e:
+                      log.write("%s attempt %d %r\n" % (url, a, e)); log.flush()
+                  time.sleep(5)
+              return None
+          def tables(txt, name):
+              try:
+                  ts = pd.read_html(io.StringIO(txt))
+              except Exception as e:
+                  log.write("%s read_html failed %r\n" % (name, e)); return 0
+              for i, t in enumerate(ts):
+                  t.to_csv("out/%s_t%d.csv" % (name, i), index=False)
+                  log.write("%s table %d shape %s cols %s\n" % (name, i, t.shape, list(t.columns)[:8]))
+              return len(ts)
+          if job == "ecos":
+              for u, n in (("https://ecos.fws.gov/ecp/report/species-listings-by-year-totals", "totals"),
+                           ("https://ecos.fws.gov/ecp/report/table/species-listings-by-year-totals.html", "totals_table"),
+                           ("https://ecos.fws.gov/ecp/report/boxscore", "boxscore"),
+                           ("https://ecos.fws.gov/ecp/report/species-delisted-extinction", "delisted_extinct")):
+                  t = get(u, n)
+                  if t: tables(t, n)
+          elif job == "aphis_flocks":
+              base = "https://www.aphis.usda.gov/livestock-poultry-disease/avian/avian-influenza/hpai-detections/commercial-backyard-flocks"
+              for p in range(0, 80):
+                  t = get(base + "?page=%d" % p, "flocks_p%d" % p)
+                  if not t or tables(t, "flocks_p%d" % p) == 0: break
+                  time.sleep(1)
+          else:
+              base = "https://www.aphis.usda.gov/livestock-poultry-disease/avian/avian-influenza/hpai-detections/wild-birds"
+              for p in range(0, 120):
+                  t = get(base + "?page=%d" % p, "wild_p%d" % p)
+                  if not t or tables(t, "wild_p%d" % p) == 0: break
+                  time.sleep(1)
+          PY
+          python3 q.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: species-loss-${{ matrix.job }}
+          path: out/
 
+cy
