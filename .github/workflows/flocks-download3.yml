@@ -1,1 +1,61 @@
+name: flocks-download3
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        idx: [0, 1, 2, 3, 4, 5]
+    steps:
+      - name: Open Download Data, pick sheet number ${{ matrix.idx }}, export CSV
+        env:
+          IDX: ${{ matrix.idx }}
+        run: |
+          mkdir -p out
+          pip install --quiet playwright
+          python3 -m playwright install --with-deps chromium > out/install.txt 2>&1 || true
+          cat > q.py <<'PY'
+          import os
+          from playwright.sync_api import sync_playwright
+          idx = int(os.environ["IDX"])
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          URL = "https://publicdashboards.dl.usda.gov/t/MRP_PUB/views/VS_Avian_HPAIConfirmedDetections2022/HPAI2022ConfirmedDetections?:embed=y&:showVizHome=no&:toolbar=yes"
+          with sync_playwright() as p:
+              b = p.chromium.launch()
+              ctx = b.new_context(accept_downloads=True, viewport={"width": 1600, "height": 1300}, user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36")
+              pg = ctx.new_page(); pg.goto(URL, wait_until="domcontentloaded", timeout=180000); pg.wait_for_timeout(30000)
+              pg.get_by_text("Download Data").first.click(); pg.wait_for_timeout(4000)
+              txt = pg.inner_text("body")
+              a = txt.find("Select a sheet from this dashboard"); z = txt.find("Select Format")
+              L("dialog text: %r" % txt[a:z+200])
+              names = [s.strip() for s in txt[a + 35:z].split("\n") if s.strip()]
+              L("sheets: %r" % names)
+              if idx >= len(names):
+                  L("no sheet at index %d" % idx); b.close(); raise SystemExit
+              name = names[idx]; L("chosen: %s" % name)
+              if idx > 0:
+                  pg.get_by_text(names[0], exact=True).first.click(); pg.wait_for_timeout(500)
+              pg.get_by_text(name, exact=True).first.click(); pg.wait_for_timeout(800)
+              pg.get_by_text("CSV", exact=True).first.click(); pg.wait_for_timeout(500)
+              pg.screenshot(path="out/before_download.png")
+              try:
+                  with pg.expect_download(timeout=90000) as dl:
+                      pg.get_by_role("button", name="Download").first.click()
+                  d = dl.value; d.save_as("out/%d_%s" % (idx, d.suggested_filename)); L("saved %s" % d.suggested_filename)
+              except Exception as e:
+                  L("download failed: %r" % e); pg.screenshot(path="out/fail.png")
+              b.close()
+          PY
+          python3 q.py || true
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: flocks-download3-${{ matrix.idx }}
+          path: out/
 
