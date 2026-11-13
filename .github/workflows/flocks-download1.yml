@@ -1,1 +1,75 @@
+name: flocks-download1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Open the APHIS flocks dashboard and use its Download menu
+        run: |
+          mkdir -p out
+          pip install --quiet playwright
+          python3 -m playwright install --with-deps chromium > out/install.txt 2>&1 || true
+          cat > q.py <<'PY'
+          import re, time
+          from playwright.sync_api import sync_playwright
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          URL = "https://publicdashboards.dl.usda.gov/t/MRP_PUB/views/VS_Avian_HPAIConfirmedDetections2022/HPAI2022ConfirmedDetections?:embed=y&:showVizHome=no&:toolbar=yes"
+          with sync_playwright() as p:
+              b = p.chromium.launch()
+              ctx = b.new_context(accept_downloads=True, viewport={"width": 1600, "height": 1300}, user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36")
+              pg = ctx.new_page()
+              pg.goto(URL, wait_until="domcontentloaded", timeout=180000); pg.wait_for_timeout(30000)
+              pg.screenshot(path="out/s1_loaded.png", full_page=True)
+              frames = [pg] + list(pg.frames)
+              L("frames: %d" % len(frames))
+              def find(txt, role=None):
+                  for f in frames:
+                      for sel in ('[aria-label="%s"]' % txt, 'button:has-text("%s")' % txt, 'text="%s"' % txt, '[data-tb-test-id*="%s" i]' % txt.lower()):
+                          try:
+                              loc = f.locator(sel).first
+                              if loc.count() and loc.is_visible(): return loc
+                          except Exception: pass
+                  return None
+              try:
+                  d = find("Download")
+                  L("download button: %r" % (d is not None))
+                  if d: d.click(); pg.wait_for_timeout(3000); pg.screenshot(path="out/s2_menu.png", full_page=True)
+                  for label in ("Data", "Crosstab", "Download data"):
+                      c = find(label)
+                      L("menu item %s: %r" % (label, c is not None))
+                      if c:
+                          c.click(); pg.wait_for_timeout(8000); pg.screenshot(path="out/s3_%s.png" % label.replace(" ", "_"), full_page=True)
+                          break
+                  # a new window or dialog with Summary and Full Data tabs may open
+                  for q in ctx.pages + [pg]:
+                      for f in q.frames:
+                          try:
+                              t = f.locator('text="Full Data"').first
+                              if t.count():
+                                  t.click(); L("clicked Full Data"); q.wait_for_timeout(5000); q.screenshot(path="out/s4_full.png", full_page=True)
+                                  for fmt in ('text="Download"', 'button:has-text("Download")', 'a:has-text("Download")'):
+                                      btn = f.locator(fmt).first
+                                      if btn.count():
+                                          with q.expect_download(timeout=120000) as dl: btn.click()
+                                          d = dl.value; d.save_as("out/" + (d.suggested_filename or "flocks.csv")); L("saved %s" % d.suggested_filename)
+                                          raise SystemExit
+                          except SystemExit: raise
+                          except Exception as e: L("err %r" % e)
+              finally:
+                  for i, q in enumerate(ctx.pages):
+                      try: open("out/page_%d.txt" % i, "w").write(q.inner_text("body")[:20000])
+                      except Exception: pass
+                  b.close()
+          PY
+          python3 q.py || true
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: flocks-download
+          path: out/
 
