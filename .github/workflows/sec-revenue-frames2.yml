@@ -1,1 +1,47 @@
+name: sec-revenue-frames2
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  frames:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        years: ["2009,2010,2011", "2012,2013,2014", "2015,2016,2017", "2018,2019,2020", "2021,2022,2023", "2024,2025"]
+    steps:
+      - name: Pull annual revenue frames for every SEC filer, by revenue tag
+        env:
+          YEARS_: ${{ matrix.years }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import os, json, time, urllib.request
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          UA = " ".join(os.environ["SEC_USER_AGENT"].split())
+          TAGS = ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "RevenueFromContractWithCustomerIncludingAssessedTax",
+                  "SalesRevenueNet", "SalesRevenueGoodsNet", "SalesRevenueServicesNet", "RevenuesNetOfInterestExpense", "InterestAndDividendIncomeOperating"]
+          for y in os.environ["YEARS_"].split(","):
+              for t in TAGS:
+                  url = "https://data.sec.gov/api/xbrl/frames/us-gaap/%s/USD/CY%s.json" % (t, y)
+                  for a in range(4):
+                      try:
+                          req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Encoding": "identity"})
+                          b = urllib.request.urlopen(req, timeout=120).read()
+                          open("out/frame_%s_%s.json" % (t, y), "wb").write(b)
+                          L("%s %s ok %d bytes" % (t, y, len(b))); break
+                      except Exception as e:
+                          L("%s %s attempt %d %r" % (t, y, a, str(e)[:80])); time.sleep(8 * (a + 1))
+                  time.sleep(0.5)
+          PY
+          python3 q.py || true
+          ls -la out | head -60
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sec-revenue-frames2-${{ strategy.job-index }}
+          path: out/
 
