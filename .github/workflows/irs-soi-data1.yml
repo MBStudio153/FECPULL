@@ -1,1 +1,72 @@
+name: irs-soi-data1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  soi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download IRS Table 1 (returns of active corporations, total receipts) for every year available
+        run: |
+          mkdir -p out/files
+          pip install --quiet requests beautifulsoup4
+          cat > q.py <<'PY'
+          import re, time, requests
+          from bs4 import BeautifulSoup
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          H = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/124 Safari/537.36"}
+          def get(u):
+              for a in range(3):
+                  try:
+                      r = requests.get(u, headers=H, timeout=120)
+                      if r.status_code == 200: return r
+                      L("  %s -> %s" % (u, r.status_code))
+                  except Exception as e: L("  %s ERROR %r" % (u, e))
+                  time.sleep(5)
+          # 1. Table 1 for 2014 to 2023 at known addresses (all-sector table of returns, total receipts)
+          for y in range(14, 24):
+              for suffix in ("co01ccr.xlsx", "co01cvccr.xlsx"):
+                  u = "https://www.irs.gov/pub/irs-soi/%d%s" % (y, suffix)
+                  r = get(u)
+                  if r: open("out/files/" + u.split("/")[-1], "wb").write(r.content); L("downloaded %s %d bytes" % (u, len(r.content)))
+                  time.sleep(1.5)
+          # 2. Older complete reports (1994 to 2013) and the 1929 to 1999 archive: save pages, list links, download Table 1 style files
+          pages = ["https://www.irs.gov/statistics/soi-tax-stats-corporation-complete-report-1994-to-2013",
+                   "https://www.irs.gov/statistics/soi-tax-stats-archive-1929-to-1999-tax-information-from-businesses",
+                   "https://www.irs.gov/statistics/soi-tax-stats-corporation-income-tax-returns-complete-report-publication-16",
+                   "https://www.irs.gov/statistics/soi-tax-stats-historical-table-13"]
+          links = []
+          for p in pages:
+              r = get(p)
+              if not r: continue
+              open("out/page_%s.html" % re.sub("[^a-z0-9]+", "_", p[-45:]), "wb").write(r.content)
+              for a in BeautifulSoup(r.content, "html.parser").find_all("a", href=True):
+                  h = a["href"]; t = a.get_text(" ", strip=True)[:120]
+                  links.append((p[-40:], t, h if h.startswith("http") else "https://www.irs.gov" + h))
+              time.sleep(2)
+          L("LINKS:")
+          seen = set()
+          for src, t, h in links:
+              if h in seen or not re.search(r"\.(xls|xlsx|csv|zip|pdf)(\?|$)|soi-tax-stats-corporation|archive|historical|table", h + t, re.I): continue
+              seen.add(h); L("  [%s] %s | %s" % (src, t, h))
+          n = 0
+          for src, t, h in links:
+              if n >= 120: break
+              fn = h.split("/")[-1].split("?")[0]
+              if re.search(r"\.(xls|xlsx|csv|zip)$", h, re.I) and (re.search(r"co01|co1\b|\d\dco1|table ?1\b|histab|tbl1|t1\.", h + " " + t, re.I)) and not re.search(r"ccr\.xlsx$", h) :
+                  if h in seen and not h in [x[2] for x in links]: continue
+                  r = get(h)
+                  if r:
+                      open("out/files/" + fn, "wb").write(r.content); L("downloaded %s %d bytes (%s)" % (h, len(r.content), t)); n += 1
+                  time.sleep(1.5)
+          PY
+          python3 q.py || true
+          ls -la out out/files | head -120
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: irs-soi-data1
+          path: out/
 
