@@ -1,1 +1,48 @@
+name: scdb-data1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  scdb:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download Supreme Court Database case-centered CSV, codebook and terms
+        run: |
+          mkdir -p out
+          pip install --quiet requests beautifulsoup4
+          cat > q.py <<'PY'
+          import re, requests
+          from bs4 import BeautifulSoup
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          H = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/124 Safari/537.36"}
+          base = "http://scdb.wustl.edu/"
+          links = []
+          for page in ["data.php", "documentation.php", "about.php", "index.php"]:
+              try:
+                  r = requests.get(base + page, headers=H, timeout=60); L("%s -> %s %d bytes" % (page, r.status_code, len(r.content)))
+                  open("out/%s.html" % page.replace(".php", ""), "wb").write(r.content)
+                  for a in BeautifulSoup(r.content, "html.parser").find_all("a", href=True):
+                      links.append((a.get_text(" ", strip=True)[:80], a["href"]))
+              except Exception as e: L("%s ERROR %r" % (page, e))
+          L("LINKS:"); [L("  %s | %s" % l) for l in links if re.search(r"csv|zip|codebook|variable|online|\\.pdf|licen|terms|cite", l[1] + l[0], re.I)]
+          want = [h for t, h in links if re.search(r"caseCentered_Citation\\.csv", h, re.I)] + [h for t, h in links if re.search(r"justiceCentered_Citation\\.csv", h, re.I)] + [h for t, h in links if re.search(r"codebook", h, re.I)]
+          seen = set()
+          for h in want:
+              url = h if h.startswith("http") else base + h.lstrip("/")
+              if url in seen: continue
+              seen.add(url)
+              try:
+                  r = requests.get(url, headers=H, timeout=180); fn = "out/" + url.split("/")[-1].split("?")[0]
+                  open(fn, "wb").write(r.content); L("downloaded %s %d bytes status %s" % (url, len(r.content), r.status_code))
+              except Exception as e: L("download %s ERROR %r" % (url, e))
+          PY
+          python3 q.py || true
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scdb-data1
+          path: out/
 
