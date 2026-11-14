@@ -1,1 +1,42 @@
+name: scdb-codebook1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  codebook:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download SCDB variable pages (party codes, legal provisions, issues) and the PDF codebook
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import re, time, requests
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          H = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/124 Safari/537.36"}
+          base = "http://scdb.wustl.edu/"
+          vars_ = ["petitioner", "respondent", "petitionerState", "respondentState", "lawType", "lawSupp", "lawMinor", "issue", "issueArea",
+                   "partyWinning", "caseDisposition", "caseDispositionUnusual", "decisionType", "jurisdiction", "caseOrigin", "caseSource",
+                   "authorityDecision", "adminAction", "usCite", "caseName", "decisionDirection", "declarationUncon", "lcDisposition"]
+          for v in vars_:
+              try:
+                  r = requests.get(base + "documentation.php?var=" + v, headers=H, timeout=120)
+                  open("out/var_%s.html" % v, "wb").write(r.content); L("%s -> %s %d bytes" % (v, r.status_code, len(r.content)))
+              except Exception as e: L("%s ERROR %r" % (v, e))
+              time.sleep(1)
+          r = requests.get(base + "documentation.php?s=2", headers=H, timeout=120)
+          for h in [x for x in sorted(set(re.findall(r'href="([^"]*\.pdf)"', r.text, re.I))) if "2026_01" in x or "2025_01" in x]:
+              try:
+                  rr = requests.get(h if h.startswith("http") else base + h.lstrip("/"), headers=H, timeout=300)
+                  open("out/" + h.split("/")[-1], "wb").write(rr.content); L("%s -> %s %d bytes" % (h, rr.status_code, len(rr.content)))
+              except Exception as e: L("%s ERROR %r" % (h, e))
+          PY
+          python3 q.py || true
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scdb-codebook1
+          path: out/
 
