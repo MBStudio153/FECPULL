@@ -1,1 +1,42 @@
+name: loc-usreports-probe1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Test how U.S. Reports opinions can be fetched from the Library of Congress
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, time, requests
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          H = {"User-Agent": "kaim-research-probe/1.0"}
+          ids = ["usrep410113", "usrep329001", "usrep347483", "usrep544469", "usrep410019", "usrep568519"]
+          for i in ids:
+              vol = i[5:8] if len(i) == 11 else i[5:-3]
+              vol = i[len("usrep"):-3]
+              tries = ["https://www.loc.gov/item/%s/?fo=json" % i,
+                       "https://tile.loc.gov/storage-services/service/ll/usrep/%s/%s/%s.pdf" % ("usrep" + vol, i, i),
+                       "https://tile.loc.gov/storage-services/service/ll/usrep/%s/%s/%s.txt" % ("usrep" + vol, i, i),
+                       "https://www.loc.gov/resource/%s/?st=text&fo=json" % i]
+              for u in tries:
+                  try:
+                      r = requests.get(u, headers=H, timeout=90)
+                      L("%s -> %s %d bytes %s" % (u, r.status_code, len(r.content), r.headers.get("content-type", "")))
+                      fn = "out/" + u.split("/")[-1].replace("?", "_").replace("=", "_").replace("&", "_")
+                      if r.status_code == 200 and len(r.content) < 3000000: open(fn, "wb").write(r.content)
+                  except Exception as e: L("%s ERROR %r" % (u, e))
+                  time.sleep(4)
+          PY
+          python3 q.py || true
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: loc-usreports-probe1
+          path: out/
 
