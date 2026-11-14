@@ -1,1 +1,47 @@
+name: loc-usreports-probe2
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Fetch six U.S. Reports opinion PDFs slowly, honoring Retry-After, and test whether the text can be read
+        run: |
+          mkdir -p out
+          sudo apt-get install -y -qq poppler-utils >/dev/null 2>&1 || true
+          cat > q.py <<'PY'
+          import time, requests, subprocess
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          H = {"User-Agent": "KAIM-Research-academic-data-collection/1.0 (public-domain court opinions, low volume)"}
+          ids = ["usrep547189", "usrep376203", "usrep466353", "usrep490107", "usrep488469", "usrep574010"]
+          for i in ids:
+              vol = i[len("usrep"):-3]
+              u = "https://tile.loc.gov/storage-services/service/ll/usrep/usrep%s/%s/%s.pdf" % (vol, i, i)
+              for a in range(6):
+                  try:
+                      r = requests.get(u, headers=H, timeout=180)
+                  except Exception as e:
+                      L("%s ERROR %r" % (i, e)); time.sleep(60); continue
+                  L("%s attempt %d -> %s %d bytes retry-after=%s" % (i, a, r.status_code, len(r.content), r.headers.get("Retry-After")))
+                  if r.status_code == 200:
+                      open("out/%s.pdf" % i, "wb").write(r.content)
+                      try:
+                          t = subprocess.run(["pdftotext", "-layout", "out/%s.pdf" % i, "out/%s.txt" % i], capture_output=True, timeout=120)
+                          L("   text chars: %d" % len(open("out/%s.txt" % i, errors="replace").read()))
+                      except Exception as e: L("   pdftotext ERROR %r" % e)
+                      break
+                  wait = int(r.headers.get("Retry-After", "0") or 0) or 120
+                  time.sleep(min(wait + 5, 600))
+              time.sleep(30)
+          PY
+          python3 q.py || true
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: loc-usreports-probe2
+          path: out/
 
