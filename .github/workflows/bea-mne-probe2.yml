@@ -1,1 +1,51 @@
+name: bea-mne-probe2
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Find parameter shapes that return BEA multinational data before 1997
+        env:
+          BEA_API_KEY: ${{ secrets.BEA_API_KEY }}
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import os, json, time, urllib.request, urllib.parse
+          K = os.environ["BEA_API_KEY"]
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          def call(p):
+              p = dict(p, UserID=K, ResultFormat="JSON")
+              url = "https://apps.bea.gov/api/data/?" + urllib.parse.urlencode(p)
+              for t in range(4):
+                  try: return json.load(urllib.request.urlopen(url, timeout=180))
+                  except Exception as e: L("   retry %d %r" % (t, str(e)[:80])); time.sleep(20)
+          n = 0
+          for direction in ("outward", "inward", "parent"):
+              for y in ("1982", "1989", "1995"):
+                  for ind in ("0000", "000", "all", None):
+                      for own in ("0", "1"):
+                          for nb in ("0", "1"):
+                              p = dict(method="GetData", datasetname="MNE", DirectionOfInvestment=direction, Classification="Country", Country="all",
+                                       Year=y, SeriesID="4", OwnershipLevel=own, NonbankAffiliatesOnly=nb)
+                              if ind: p["Industry"] = ind
+                              r = call(p); time.sleep(1.5)
+                              try:
+                                  res = r["BEAAPI"]["Results"]; rows = res["Data"] if isinstance(res, dict) else res[0]["Data"]
+                                  L("%s %s ind=%s own=%s nb=%s -> %d rows" % (direction, y, ind, own, nb, len(rows)))
+                                  if rows and n < 12:
+                                      json.dump(rows[:40], open("out/hit_%s_%s_%s_%s_%s.json" % (direction, y, ind, own, nb), "w"), indent=1); n += 1
+                              except Exception:
+                                  L("%s %s ind=%s own=%s nb=%s -> error %s" % (direction, y, ind, own, nb, json.dumps(r)[-220:] if r else "none"))
+          PY
+          python3 q.py || true
+          ls -la out | head -30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bea-mne-probe2
+          path: out/
 
