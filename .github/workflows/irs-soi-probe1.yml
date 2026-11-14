@@ -1,1 +1,60 @@
+name: irs-soi-probe1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  soi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Crawl IRS Statistics of Income corporation pages and download the annual tables
+        run: |
+          mkdir -p out/files
+          pip install --quiet requests beautifulsoup4
+          cat > q.py <<'PY'
+          import re, time, requests
+          from bs4 import BeautifulSoup
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          H = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/124 Safari/537.36"}
+          pages = [
+            "https://www.irs.gov/statistics/soi-tax-stats-corporation-statistics-of-income-returns-of-active-corporations",
+            "https://www.irs.gov/statistics/soi-tax-stats-corporation-complete-report",
+            "https://www.irs.gov/statistics/soi-tax-stats-corporation-tax-statistics",
+            "https://www.irs.gov/statistics/soi-tax-stats-historical-table-13",
+            "https://www.irs.gov/statistics/soi-tax-stats-integrated-business-data",
+            "https://www.irs.gov/statistics/soi-tax-stats-historical-data-tables",
+          ]
+          found = []
+          for p in pages:
+              try:
+                  r = requests.get(p, headers=H, timeout=90); L("%s -> %s %d bytes" % (p, r.status_code, len(r.content)))
+                  open("out/page_%s.html" % re.sub("[^a-z0-9]+", "_", p[-50:]), "wb").write(r.content)
+                  for a in BeautifulSoup(r.content, "html.parser").find_all("a", href=True):
+                      h = a["href"]; t = a.get_text(" ", strip=True)[:100]
+                      if re.search(r"\.(xls|xlsx|csv|zip|pdf)$", h, re.I) or re.search(r"table 1\b|receipts|returns of active|complete report|historical", t, re.I):
+                          found.append((t, h if h.startswith("http") else "https://www.irs.gov" + h))
+              except Exception as e: L("%s ERROR %r" % (p, e))
+              time.sleep(2)
+          seen = set(); L("LINKS:")
+          for t, h in found:
+              if h in seen: continue
+              seen.add(h); L("  %s | %s" % (t, h))
+          n = 0
+          for t, h in found:
+              if n >= 40: break
+              if re.search(r"\.(xls|xlsx|csv)$", h, re.I) and re.search(r"corp|/co\d|table|receipt|active|13", h + t, re.I):
+                  try:
+                      r = requests.get(h, headers=H, timeout=120)
+                      open("out/files/" + h.split("/")[-1], "wb").write(r.content); L("downloaded %s %d bytes" % (h, len(r.content))); n += 1
+                  except Exception as e: L("download %s ERROR %r" % (h, e))
+                  time.sleep(2)
+          PY
+          python3 q.py || true
+          ls -la out out/files | head -80
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: irs-soi-probe1
+          path: out/
 
