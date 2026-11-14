@@ -1,1 +1,59 @@
+name: scdb-data4
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  scdb:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {db: modern, page: "data.php", tag: modern}
+          - {db: legacy, page: "data.php?s=2", tag: legacy}
+    steps:
+      - name: Download every CSV file set of one SCDB database, plus codebook and citation pages
+        env:
+          PAGE_: ${{ matrix.page }}
+          DB_: ${{ matrix.db }}
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import os, re, requests
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          H = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/124 Safari/537.36"}
+          base = "http://scdb.wustl.edu/"
+          db = os.environ["DB_"]
+          r = requests.get(base + os.environ["PAGE_"], headers=H, timeout=120)
+          open("out/page_%s.html" % db, "wb").write(r.content); L("page %s %d bytes" % (r.status_code, len(r.content)))
+          hrefs = sorted(set(re.findall(r'href="([^"]*_brickFiles[^"]*)"', r.text)))
+          L("brick links: %d" % len(hrefs))
+          csvs = [h for h in hrefs if h.lower().endswith(".csv.zip")]
+          if db == "modern": csvs = [h for h in csvs if "Legacy" not in h]
+          for h in csvs:
+              try:
+                  rr = requests.get(base + h.lstrip("/"), headers=H, timeout=300)
+                  open("out/" + h.split("/")[-1], "wb").write(rr.content); L("%s -> %s %d bytes" % (h, rr.status_code, len(rr.content)))
+              except Exception as e: L("%s ERROR %r" % (h, e))
+          if db == "modern":
+              for u in ["documentation.php?var=cite", "documentation.php?s=1", "documentation.php?s=2", "about.php"]:
+                  try:
+                      rr = requests.get(base + u, headers=H, timeout=120)
+                      open("out/" + u.replace("?", "_").replace("=", "_").replace(".php", "") + ".html", "wb").write(rr.content); L("%s -> %s %d bytes" % (u, rr.status_code, len(rr.content)))
+                  except Exception as e: L("%s ERROR %r" % (u, e))
+              for h in [h for h in hrefs if h.lower().endswith(".pdf")] + re.findall(r'href="([^"]*codebook[^"]*\.pdf)"', r.text, re.I):
+                  try:
+                      rr = requests.get(base + h.lstrip("/"), headers=H, timeout=120)
+                      open("out/" + h.split("/")[-1], "wb").write(rr.content); L("%s -> %s %d bytes" % (h, rr.status_code, len(rr.content)))
+                  except Exception as e: L("%s ERROR %r" % (h, e))
+          PY
+          python3 q.py || true
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scdb-data4-${{ matrix.tag }}
+          path: out/
 
