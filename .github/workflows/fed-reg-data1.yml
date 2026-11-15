@@ -1,1 +1,54 @@
+name: fedreg-tariff-data1
+on: workflow_dispatch
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Federal Register, presidential documents that mention tariffs
+        run: |
+          mkdir -p out
+          cat > f.py <<'PY'
+          import json, time, urllib.parse, urllib.request
+          B = "https://www.federalregister.gov/api/v1/documents.json"
+          UA = {"User-Agent": "kaim-research/1.0"}
+          log = open("out/log.txt", "w")
+          def get(p):
+              url = B + "?" + urllib.parse.urlencode(p, doseq=True)
+              for a in range(4):
+                  try:
+                      return urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=120).read().decode("utf-8", "replace")
+                  except Exception as e:
+                      err = repr(e)[:120]; time.sleep(10 * (a + 1))
+              return "ERROR " + err
+          for kind in ("executive_order", "proclamation"):
+              counts = {}
+              for yr in range(1994, 2027):
+                  p = {"conditions[type][]": "PRESDOCU", "conditions[presidential_document_type][]": kind, "conditions[term]": "tariff",
+                       "conditions[publication_date][gte]": "%d-01-01" % yr, "conditions[publication_date][lte]": "%d-12-31" % yr, "per_page": 1}
+                  r = get(p)
+                  try: counts[yr] = json.loads(r)["count"]
+                  except Exception: counts[yr] = None
+                  log.write("%s %d %s\n" % (kind, yr, counts[yr])); log.flush(); time.sleep(1)
+              open("out/count_%s_tariff_by_year.json" % kind, "w").write(json.dumps(counts))
+              docs = []
+              page = 1
+              while page <= 20:
+                  r = get({"conditions[type][]": "PRESDOCU", "conditions[presidential_document_type][]": kind, "conditions[term]": "tariff", "conditions[publication_date][gte]": "2016-12-01",
+                           "per_page": 100, "page": page, "order": "oldest", "fields[]": ["title", "document_number", "publication_date", "executive_order_number", "html_url"]})
+                  try: d = json.loads(r)
+                  except Exception: break
+                  docs += d.get("results", [])
+                  if not d.get("next_page_url"): break
+                  page += 1; time.sleep(1)
+              open("out/list_%s_tariff_since_2016.json" % kind, "w").write(json.dumps(docs))
+              log.write("%s listed %d\n" % (kind, len(docs))); log.flush()
+          PY
+          python3 f.py
+          tail -5 out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fedreg-tariff-data1
+          path: out/
 
