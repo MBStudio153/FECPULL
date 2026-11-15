@@ -1,1 +1,49 @@
+name: cdc-kindergarten1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: CDC kindergarten vaccination coverage and exemptions, all rows
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, re, time, urllib.parse, urllib.request
+          UA = {"User-Agent": "kaim-research/1.0"}
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          def http(u, tries=4):
+              for a in range(tries):
+                  try:
+                      return urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=180).read()
+                  except Exception as e:
+                      L("  %s ERROR %s" % (u[:100], str(e)[:100])); time.sleep(8 * (a + 1))
+          base = "https://data.cdc.gov/resource/ijqb-a7ye.json"
+          rows = []; off = 0
+          while True:
+              r = http(base + "?$limit=50000&$offset=%d&$order=:id" % off)
+              if not r: break
+              d = json.loads(r)
+              rows += d; L("offset %d got %d" % (off, len(d)))
+              if len(d) < 50000: break
+              off += 50000; time.sleep(2)
+          json.dump(rows, open("out/cdc_kindergarten_all.json", "w"))
+          L("total rows %d" % len(rows))
+          import collections
+          c = collections.Counter((x.get("vaccine"), x.get("dose", "")) for x in rows)
+          for k, v in c.most_common(30): L("  %s %s" % (k, v))
+          c2 = collections.Counter(x.get("year_season") for x in rows)
+          L("seasons: " + ", ".join(sorted(c2)))
+          PY
+          python3 q.py || true
+          ls -la out
+          tail -40 out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cdc-kindergarten1
+          path: out/
 
