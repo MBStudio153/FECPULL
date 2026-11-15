@@ -1,1 +1,62 @@
+name: science-grants-probe1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Probe federal science grant counts and dollars (NIH, NSF, USAspending)
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, re, time, urllib.parse, urllib.request
+          UA = {"User-Agent": "kaim-research/1.0 (info@kaimresearch.com)", "Content-Type": "application/json"}
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          def http(u, data=None, tries=3):
+              for a in range(tries):
+                  try:
+                      req = urllib.request.Request(u, data=(json.dumps(data).encode() if data is not None else None), headers=UA)
+                      return urllib.request.urlopen(req, timeout=120).read()
+                  except Exception as e:
+                      L("  %s ERROR %s" % (u[:90], str(e)[:100])); time.sleep(6)
+          # NIH RePORTER: number of funded projects per fiscal year (meta.total)
+          nih = {}
+          for fy in range(1985, 2026):
+              r = http("https://api.reporter.nih.gov/v2/projects/search", {"criteria": {"fiscal_years": [fy]}, "include_fields": ["ApplId"], "offset": 0, "limit": 1})
+              if r:
+                  try: nih[fy] = json.loads(r)["meta"]["total"]; L("NIH %d projects %d" % (fy, nih[fy]))
+                  except Exception as e: L("NIH %d parse %r %s" % (fy, e, r[:120]))
+              time.sleep(1.2)
+          json.dump(nih, open("out/nih_projects_by_fy.json", "w"))
+          # NIH ExPORTER bulk file (dollars per project): check that a yearly file exists, headers only
+          for fy in (2000, 2024):
+              u = "https://reporter.nih.gov/exporter/projects/download/%d" % fy
+              try:
+                  req = urllib.request.Request(u, headers=UA, method="HEAD"); h = urllib.request.urlopen(req, timeout=60)
+                  L("EXPORTER %d -> %s %s %s" % (fy, h.status, h.headers.get("Content-Type"), h.headers.get("Content-Length")))
+              except Exception as e: L("EXPORTER %d ERROR %s" % (fy, str(e)[:100]))
+          # NSF Award API: one year sample
+          r = http("https://api.nsf.gov/services/v1/awards.json?dateStart=01/01/2023&dateEnd=12/31/2023&printFields=id,fundsObligatedAmt&rpp=5")
+          L("NSF sample: " + (r[:400].decode("utf-8", "replace") if r else "none"))
+          open("out/nsf_sample.json", "wb").write(r or b"")
+          # USAspending: grant dollars by fiscal year for NSF, HHS and NIH
+          for name, ag in (("NSF", {"type": "awarding", "tier": "toptier", "name": "National Science Foundation"}),
+                           ("HHS", {"type": "awarding", "tier": "toptier", "name": "Department of Health and Human Services"}),
+                           ("NIH", {"type": "awarding", "tier": "subtier", "name": "National Institutes of Health", "toptier_name": "Department of Health and Human Services"})):
+              body = {"group": "fiscal_year", "filters": {"award_type_codes": ["02", "03", "04", "05"], "agencies": [ag], "time_period": [{"start_date": "2007-10-01", "end_date": "2025-09-30"}]}}
+              r = http("https://api.usaspending.gov/api/v2/search/spending_over_time/", body)
+              L("USASPENDING %s: %s" % (name, r[:500].decode("utf-8", "replace") if r else "none"))
+              open("out/usaspending_%s.json" % name, "wb").write(r or b""); time.sleep(3)
+          PY
+          python3 q.py || true
+          ls -la out
+          tail -40 out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: science-grants-probe1
+          path: out/
 
