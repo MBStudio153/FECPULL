@@ -1,1 +1,51 @@
+name: science-trust-probe3
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Probe trust in science and vaccine exemption data (GSS, NSF indicators, CDC)
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, re, time, urllib.parse, urllib.request
+          UA = {"User-Agent": "kaim-research/1.0 (info@kaimresearch.com)", "Content-Type": "application/json"}
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          def http(u, data=None, tries=3):
+              for a in range(tries):
+                  try:
+                      req = urllib.request.Request(u, data=(json.dumps(data).encode() if data is not None else None), headers=UA)
+                      return urllib.request.urlopen(req, timeout=120).read()
+                  except Exception as e:
+                      L("  %s ERROR %s" % (u[:90], str(e)[:100])); time.sleep(6)
+          pages = {"gss_data": "https://gss.norc.org/us/en/gss/get-the-data.html", "gss_home": "https://gss.norc.org/",
+                   "nsf_sei_attitudes": "https://ncses.nsf.gov/pubs/nsb20247", "nsf_sei_home": "https://ncses.nsf.gov/indicators",
+                   "cdc_k_coverage_meta": "https://data.cdc.gov/api/views/ijqb-a7ye.json",
+                   "cdc_k_coverage_sample": "https://data.cdc.gov/resource/ijqb-a7ye.json?$limit=5",
+                   "cdc_k_coverage_meta2": "https://data.cdc.gov/api/views/metadata/v1/ijqb-a7ye"}
+          for k, u in pages.items():
+              r = http(u)
+              if r:
+                  open("out/%s.txt" % k, "wb").write(r); L("%s %d bytes" % (k, len(r)))
+                  t = r.decode("utf-8", "replace")
+                  for m in re.findall(r'href="([^"]+\.(?:xlsx?|csv|zip|dta|sav|pdf))"', t, re.I)[:40]: L("   file: %s" % m)
+              time.sleep(2)
+          # GSS public file location check (headers only)
+          for u in ("https://gss.norc.org/content/dam/gss/get-the-data/documents/stata/GSS_stata.zip", "https://gss.norc.org/content/dam/gss/get-the-data/documents/spss/GSS_spss.zip"):
+              try:
+                  h = urllib.request.urlopen(urllib.request.Request(u, headers=UA, method="HEAD"), timeout=60); L("GSS file %s -> %s %s" % (u[-40:], h.status, h.headers.get("Content-Length")))
+              except Exception as e: L("GSS file %s ERROR %s" % (u[-40:], str(e)[:90]))
+          PY
+          python3 q.py || true
+          ls -la out
+          tail -40 out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: science-trust-probe3
+          path: out/
 
