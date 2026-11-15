@@ -1,1 +1,48 @@
+name: elimination-malaria1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install the browser
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+      - name: WHO malaria-free certification list, rendered page
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, re, time, urllib.parse, urllib.request
+          UA = {"User-Agent": "kaim-research/1.0"}
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          from playwright.sync_api import sync_playwright
+          URLS = {"malaria_certified": "https://www.who.int/teams/global-malaria-programme/elimination/countries-and-territories-certified-malaria-free-by-who",
+                  "mnt_elimination": "https://www.who.int/teams/immunization-vaccines-and-biologicals/diseases/maternal-and-neonatal-tetanus",
+                  "measles_elim": "https://www.who.int/teams/immunization-vaccines-and-biologicals/diseases/measles"}
+          with sync_playwright() as p:
+              b = p.chromium.launch()
+              pg = b.new_page()
+              for k, u in URLS.items():
+                  try:
+                      pg.goto(u, wait_until="networkidle", timeout=90000)
+                      pg.wait_for_timeout(4000)
+                      open("out/%s.txt" % k, "w").write(pg.inner_text("body"))
+                      open("out/%s.html" % k, "w").write(pg.content())
+                      L("%s ok %d chars" % (k, len(pg.inner_text("body"))))
+                  except Exception as e:
+                      L("%s ERROR %s" % (k, str(e)[:150]))
+              b.close()
+          PY
+          python3 q.py || true
+          ls -la out
+          tail -40 out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: elimination-malaria1
+          path: out/
 
