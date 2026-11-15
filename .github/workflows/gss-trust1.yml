@@ -1,1 +1,47 @@
+name: gss-trust1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Install pandas
+        run: pip install pandas
+      - name: General Social Survey, confidence in science by year
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, re, time, urllib.parse, urllib.request
+          UA = {"User-Agent": "kaim-research/1.0"}
+          import zipfile, io, os
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          import pandas as pd
+          req = urllib.request.Request("https://gss.norc.org/content/dam/gss/get-the-data/documents/stata/GSS_stata.zip", headers={"User-Agent": "kaim-research/1.0"})
+          raw = urllib.request.urlopen(req, timeout=600).read()
+          L("zip bytes %d" % len(raw))
+          z = zipfile.ZipFile(io.BytesIO(raw))
+          name = [n for n in z.namelist() if n.lower().endswith(".dta")][0]
+          z.extract(name, "tmp"); L("extracted " + name)
+          df = pd.read_stata("tmp/" + name, convert_categoricals=True, columns=None)
+          df.columns = [c.lower() for c in df.columns]
+          L("rows %d cols %d" % df.shape)
+          want = [c for c in ["year", "wtssall", "wtssps", "consci", "scibnfts", "sciprog", "scifrom", "nextgen", "scientgo", "toofast", "conclerg", "conmedic", "coneduc", "confinan"] if c in df.columns]
+          L("have " + ",".join(want))
+          out = df[want].copy()
+          out.to_csv("out/gss_science_vars.csv", index=False)
+          for v in [c for c in want if c not in ("year", "wtssall", "wtssps")]:
+              t = out.groupby(["year", v], observed=True).size().unstack(fill_value=0)
+              t.to_csv("out/by_year_%s.csv" % v); L("table " + v)
+          PY
+          python3 q.py || true
+          ls -la out
+          tail -40 out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gss-trust1
+          path: out/
 
