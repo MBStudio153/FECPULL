@@ -1,1 +1,49 @@
+name: elimination-who1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: WHO GHO disease elimination, certification and eradication series
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, re, time, urllib.parse, urllib.request
+          UA = {"User-Agent": "kaim-research/1.0"}
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          def http(u, tries=4):
+              for a in range(tries):
+                  try:
+                      return urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=180).read()
+                  except Exception as e:
+                      L("  %s ERROR %s" % (u[:100], str(e)[:100])); time.sleep(8 * (a + 1))
+          B = "https://ghoapi.azureedge.net/api/"
+          # find every indicator about elimination, certification, validation or eradication
+          r = http(B + "Indicator")
+          codes = []
+          if r:
+              inds = json.loads(r).get("value", [])
+              open("out/all_indicators.json", "wb").write(r)
+              for x in inds:
+                  n = x.get("IndicatorName", "")
+                  if re.search(r"elimination|eradicat|certif|validat|verif|free of|malaria.*(free|cert)|polio.*(free|cert)", n, re.I):
+                      codes.append(x["IndicatorCode"]); L("%s | %s" % (x["IndicatorCode"], n[:120]))
+          for c in sorted(set(codes + ["NTD_6", "NTD_2"])):
+              d = http(B + c)
+              if d:
+                  open("out/gho_%s.json" % c, "wb").write(d); L("%s %d bytes" % (c, len(d)))
+              time.sleep(1)
+          PY
+          python3 q.py || true
+          ls -la out
+          tail -40 out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: elimination-who1
+          path: out/
 
