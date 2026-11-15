@@ -1,1 +1,55 @@
+name: science-studies-probe2
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Probe counts of research studies, open access and trials (PubMed, PMC, ClinicalTrials.gov)
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, re, time, urllib.parse, urllib.request
+          UA = {"User-Agent": "kaim-research/1.0 (info@kaimresearch.com)", "Content-Type": "application/json"}
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          def http(u, data=None, tries=3):
+              for a in range(tries):
+                  try:
+                      req = urllib.request.Request(u, data=(json.dumps(data).encode() if data is not None else None), headers=UA)
+                      return urllib.request.urlopen(req, timeout=120).read()
+                  except Exception as e:
+                      L("  %s ERROR %s" % (u[:90], str(e)[:100])); time.sleep(6)
+          E = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?retmode=json&rettype=count&db=%s&term=%s"
+          def count(db, term):
+              r = http(E % (db, urllib.parse.quote(term)))
+              try: return int(json.loads(r)["esearchresult"]["count"])
+              except Exception: L("  parse fail %s %s" % (db, term)); return None
+          out = {}
+          for y in range(1950, 2026):
+              row = {"pubmed": count("pubmed", "%d[dp]" % y), "pubmed_free_full_text": count("pubmed", "%d[dp] AND free full text[sb]" % y),
+                     "pubmed_nih_extramural": count("pubmed", '%d[dp] AND "research support, n.i.h., extramural"[pt]' % y),
+                     "pubmed_clinical_trial": count("pubmed", '%d[dp] AND "clinical trial"[pt]' % y), "pmc": count("pmc", "%d[pdat]" % y)}
+              out[y] = row; L("%d %s" % (y, row)); time.sleep(1.2)
+          json.dump(out, open("out/pubmed_counts_by_year.json", "w"))
+          # ClinicalTrials.gov: registered studies by start year
+          ct = {}
+          for y in range(1999, 2026):
+              u = "https://clinicaltrials.gov/api/v2/studies?countTotal=true&pageSize=1&query.term=" + urllib.parse.quote("AREA[StartDate]RANGE[%d-01-01,%d-12-31]" % (y, y))
+              r = http(u)
+              try: ct[y] = json.loads(r)["totalCount"]; L("CT %d %d" % (y, ct[y]))
+              except Exception: L("CT %d parse fail" % y)
+              time.sleep(1.2)
+          json.dump(ct, open("out/clinicaltrials_by_start_year.json", "w"))
+          PY
+          python3 q.py || true
+          ls -la out
+          tail -40 out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: science-studies-probe2
+          path: out/
 
