@@ -1,1 +1,54 @@
+name: bea-mne-fill2
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Re-pull missing BEA outward year and series combinations, slowly
+        env:
+          BEA_API_KEY: ${{ secrets.BEA_API_KEY }}
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import os, json, time, urllib.request, urllib.parse
+          K = os.environ["BEA_API_KEY"]; DIR = "outward"
+          WANT = [[1997, "14"], [1998, "14"], [2005, "14"], [2006, "6"], [2008, "14"], [2024, "1"], [2024, "4"], [2024, "6"], [2024, "7"], [2024, "8"], [2024, "14"]]
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          def call(p):
+              p = dict(p, UserID=K, ResultFormat="JSON")
+              url = "https://apps.bea.gov/api/data/?" + urllib.parse.urlencode(p)
+              for t in range(6):
+                  try:
+                      return json.load(urllib.request.urlopen(url, timeout=180))
+                  except Exception as e:
+                      L("   retry %d %r" % (t, str(e)[:80])); time.sleep(60 if "429" in str(e) else 15)
+          out = []
+          for y, s in WANT:
+              got = False
+              for own in ("1", "0"):
+                  for nb in ("0", "1"):
+                      p = dict(method="GetData", datasetname="MNE", DirectionOfInvestment=DIR, Classification="Country", Country="all",
+                               Year=str(y), SeriesID=s, OwnershipLevel=own, NonbankAffiliatesOnly=nb, Industry="0000")
+                      r = call(p); time.sleep(4)
+                      try:
+                          res = r["BEAAPI"]["Results"]; rows = res["Data"] if isinstance(res, dict) else res[0]["Data"]
+                      except Exception:
+                          err = json.dumps(r)[:200] if r else "no response"; continue
+                      if rows:
+                          out.append({"year": y, "series": s, "ownership": own, "nonbank": nb, "rows": rows}); L("%s %d s%s own%s nb%s: %d rows" % (DIR, y, s, own, nb, len(rows))); got = True; break
+                  if got: break
+              if not got: L("%s %d s%s: no data (%s)" % (DIR, y, s, locals().get("err", "")))
+          json.dump(out, open("out/bea_fill_%s.json" % DIR, "w"))
+          PY
+          python3 q.py || true
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bea-mne-fill2
+          path: out/
 
