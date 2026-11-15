@@ -1,1 +1,62 @@
+name: elimination-probe1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Find WHO and PAHO disease elimination status data
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, re, time, urllib.parse, urllib.request
+          UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/124 Safari/537.36"}
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          def get(u):
+              for a in range(3):
+                  try:
+                      return urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=120).read()
+                  except Exception as e:
+                      L("  %s ERROR %r" % (u, str(e)[:100])); time.sleep(6)
+          # 1. WHO Global Health Observatory: every indicator whose name mentions elimination, certification, validation or eradication
+          for word in ("eliminat", "certif", "validat", "eradicat", "free of"):
+              u = "https://ghoapi.azureedge.net/api/Indicator?$filter=" + urllib.parse.quote("contains(IndicatorName,'%s')" % word)
+              r = get(u)
+              if r:
+                  open("out/gho_indicators_%s.json" % word.replace(" ", "_"), "wb").write(r)
+                  try:
+                      L("GHO %s: %d indicators" % (word, len(json.loads(r)["value"])))
+                      for x in json.loads(r)["value"]: L("   %s | %s" % (x["IndicatorCode"], x["IndicatorName"]))
+                  except Exception as e: L("  parse %r" % e)
+              time.sleep(2)
+          # 2. Pages that list elimination, certification and verification status by country
+          pages = {
+            "who_malaria_certified": "https://www.who.int/teams/global-malaria-programme/elimination/countries-and-territories-certified-malaria-free-by-who",
+            "who_ntd_validated": "https://www.who.int/teams/control-of-neglected-tropical-diseases/overview/ntd-elimination-validation",
+            "who_polio_status": "https://polioeradication.org/where-we-work/",
+            "who_mnt_elimination": "https://www.who.int/initiatives/maternal-and-neonatal-tetanus-elimination-(mnte)",
+            "paho_measles_review": "https://www.paho.org/en/news/2-3-2026-update-review-measles-elimination-status",
+            "paho_measles_us_mexico": "https://www.paho.org/en/news/16-1-2026-measles-elimination-status-united-states-and-mexico",
+            "paho_elimination_initiative": "https://www.paho.org/en/topics/elimination-initiative",
+            "who_measles_rubella": "https://www.who.int/teams/immunization-vaccines-and-biologicals/diseases/measles",
+            "cdc_measles_elimination": "https://www.cdc.gov/measles/about/measles-elimination.html",
+          }
+          for k, u in pages.items():
+              r = get(u)
+              if r:
+                  open("out/page_%s.html" % k, "wb").write(r); L("page %s %d bytes" % (k, len(r)))
+                  for m in re.findall(r'href="([^"]+\.(?:xlsx?|csv|zip|pdf))"', r.decode("utf-8", "replace"), re.I)[:40]: L("   file: %s" % m)
+              time.sleep(2)
+          PY
+          python3 q.py || true
+          ls -la out
+          tail -60 out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: elimination-probe1
+          path: out/
 
