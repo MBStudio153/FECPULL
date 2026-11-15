@@ -1,1 +1,70 @@
+name: death-access-probe1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Probe health access, cost and mortality data sources
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, re, time, urllib.parse, urllib.request
+          UA = {"User-Agent": "kaim-research/1.0", "Content-Type": "application/json"}
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          def http(u, data=None, tries=3):
+              for a in range(tries):
+                  try:
+                      req = urllib.request.Request(u, data=(json.dumps(data).encode() if data is not None else None), headers=UA)
+                      return urllib.request.urlopen(req, timeout=120).read()
+                  except Exception as e:
+                      L("  %s ERROR %s" % (u[:90], str(e)[:100])); time.sleep(6)
+          # 1. Socrata catalog searches on federal health data portals
+          terms = ["emergency department visits", "hypothermia cold exposure deaths", "seat belt restraint use", "death rate income poverty", "medicaid enrollment", "uninsured", "medical debt", "substance use disorder prevalence", "firearm injury", "drug prices"]
+          for dom in ("data.cdc.gov", "healthdata.gov", "data.cms.gov"):
+              for t in terms:
+                  u = "https://api.us.socrata.com/api/catalog/v1?domains=%s&limit=8&q=%s" % (dom, urllib.parse.quote(t))
+                  r = http(u)
+                  if r:
+                      d = json.loads(r)
+                      L("== %s | %s" % (dom, t))
+                      for x in d.get("results", []):
+                          c = x["resource"]; L("   %s | %s | %s | updated %s" % (c.get("id"), c.get("name", "")[:80], c.get("type"), str(c.get("data_updated_at", ""))[:10]))
+                  time.sleep(1)
+          # 2. Pages to inspect for downloadable files
+          pages = {"nhtsa_seatbelt": "https://www.nhtsa.gov/risky-driving/seat-belts",
+                   "nhtsa_crashstats": "https://crashstats.nhtsa.dot.gov/",
+                   "fbi_active_shooter": "https://www.fbi.gov/how-we-can-help-you/active-shooter-safety-resources",
+                   "eia_recs_2020": "https://www.eia.gov/consumption/residential/data/2020/",
+                   "nyfed_hhdc": "https://www.newyorkfed.org/microeconomics/hhdc",
+                   "cfpb_medical_debt": "https://www.consumerfinance.gov/data-research/research-reports/medical-debt-burden-in-the-united-states/",
+                   "liheap_funding": "https://acf.gov/ocs/programs/liheap",
+                   "cms_nhe_historical": "https://www.cms.gov/data-research/statistics-trends-and-reports/national-health-expenditure-data/historical",
+                   "samhsa_nsduh": "https://www.samhsa.gov/data/data-we-collect/nsduh-national-survey-drug-use-and-health",
+                   "nchs_nhamcs": "https://www.cdc.gov/nchs/nhamcs/index.html",
+                   "uscourts_bankruptcy": "https://www.uscourts.gov/statistics-reports/caseload-statistics-data-tables",
+                   "census_sipp_medical": "https://www.census.gov/topics/health/health-insurance.html"}
+          for k, u in pages.items():
+              r = http(u)
+              if r:
+                  open("out/%s.txt" % k, "wb").write(r); L("%s %d bytes" % (k, len(r)))
+                  t = r.decode("utf-8", "replace")
+                  for m in re.findall(r'href="([^"]+\.(?:xlsx?|csv|zip|pdf))"', t, re.I)[:30]: L("   file: %s" % m)
+              time.sleep(2)
+          # 3. BLS public API: CPI medicinal drugs and medical care, annual
+          body = {"seriesid": ["CUUR0000SEMF01", "CUUR0000SAM2", "CUUR0000SEMC01"], "startyear": "2006", "endyear": "2025", "annualaverage": True}
+          r = http("https://api.bls.gov/publicAPI/v1/timeseries/data/", body)
+          if r: open("out/bls_cpi_medical.json", "wb").write(r); L("bls cpi %d bytes" % len(r))
+          PY
+          python3 q.py || true
+          ls -la out
+          tail -60 out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: death-access-probe1
+          path: out/
 
