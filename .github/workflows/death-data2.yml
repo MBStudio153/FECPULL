@@ -1,1 +1,49 @@
+name: death-data2
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: BLS medical prices and CDC emergency visit, insurance and death rate datasets
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, time, urllib.request
+          UA = {"User-Agent": "kaim-research/1.0", "Content-Type": "application/json"}
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          def http(u, data=None, tries=4):
+              for a in range(tries):
+                  try:
+                      req = urllib.request.Request(u, data=(json.dumps(data).encode() if data is not None else None), headers=UA)
+                      return urllib.request.urlopen(req, timeout=180).read()
+                  except Exception as e:
+                      L("  %s ERROR %s" % (u[:100], str(e)[:100])); time.sleep(8 * (a + 1))
+          body = {"seriesid": ["CUUR0000SEMF01", "CUUR0000SAM2", "CUUR0000SEMC01"], "startyear": "2016", "endyear": "2025", "annualaverage": True}
+          r = http("https://api.bls.gov/publicAPI/v1/timeseries/data/", body)
+          if r: open("out/bls_cpi_medical_2016_2025.json", "wb").write(r); L("bls %d bytes" % len(r))
+          body["startyear"] = "2026"; body["endyear"] = "2026"
+          r = http("https://api.bls.gov/publicAPI/v1/timeseries/data/", body)
+          if r: open("out/bls_cpi_medical_2026.json", "wb").write(r); L("bls2026 %d bytes" % len(r))
+          for ds in ("ycxr-emue", "jb9g-gnvr", "w9j2-ggv5", "489q-934x", "bi63-dtpu"):
+              rows = []; off = 0
+              while True:
+                  r = http("https://data.cdc.gov/resource/%s.json?$limit=50000&$offset=%d" % (ds, off))
+                  if not r: break
+                  d = json.loads(r); rows += d
+                  if len(d) < 50000: break
+                  off += 50000; time.sleep(2)
+              open("out/cdc_%s.json" % ds, "w").write(json.dumps(rows)); L("%s rows %d" % (ds, len(rows)))
+          PY
+          python3 q.py || true
+          ls -la out
+          tail -30 out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: death-data2
+          path: out/
 
