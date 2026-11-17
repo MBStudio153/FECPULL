@@ -1,1 +1,59 @@
+name: cancer-data1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Find and pull every cancer dataset on data.cdc.gov (government only)
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, re, time, urllib.parse, urllib.request
+          UA = {"User-Agent": "kaim-research/1.0"}
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush()
+          def http(u, tries=4):
+              for a in range(tries):
+                  try:
+                      return urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=180).read()
+                  except Exception as e:
+                      L("  %s ERROR %s" % (u[:110], str(e)[:100])); time.sleep(8 * (a + 1))
+          found = {}
+          for q in ("cancer", "cancer incidence", "cancer mortality", "cancer screening", "cancer survival", "mammography", "colorectal", "tumor"):
+              u = "https://api.us.socrata.com/api/catalog/v1?" + urllib.parse.urlencode({"domains": "data.cdc.gov", "search_context": "data.cdc.gov", "q": q, "only": "dataset", "limit": 100})
+              r = http(u)
+              if not r: continue
+              for x in json.loads(r).get("results", []):
+                  res = x["resource"]
+                  found[res["id"]] = {"name": res["name"], "updated": res.get("data_updated_at"), "desc": (res.get("description") or "")[:300], "cols": res.get("columns_name", [])[:25], "link": x.get("permalink")}
+              time.sleep(2)
+          open("out/catalog.json", "w").write(json.dumps(found, indent=1))
+          L("catalog datasets %d" % len(found))
+          for ds, m in found.items():
+              if not re.search(r"cancer|tumor|mammo|colorectal|cervical|prostate|melanoma|oncolog", m["name"], re.I): continue
+              r = http("https://data.cdc.gov/resource/%s.json?$select=count(*)" % ds)
+              try: n = int(json.loads(r)[0]["count"])
+              except Exception: n = -1
+              L("%s | %s | rows %d" % (ds, m["name"][:80], n))
+              if n < 0 or n > 400000: continue
+              rows = []; off = 0
+              while True:
+                  r = http("https://data.cdc.gov/resource/%s.json?$limit=50000&$offset=%d" % (ds, off))
+                  if not r: break
+                  d = json.loads(r); rows += d
+                  if len(d) < 50000: break
+                  off += 50000; time.sleep(2)
+              open("out/cdc_%s.json" % ds, "w").write(json.dumps(rows)); L("  saved %d" % len(rows))
+          PY
+          python3 q.py || true
+          ls -la out
+          tail -60 out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cancer-data1
+          path: out/
 
