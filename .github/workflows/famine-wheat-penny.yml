@@ -1,1 +1,45 @@
+name: famine-wheat-penny1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: US wheat price received per bushel, annual and monthly (NASS), plus CPI
+        env:
+          NASS_API_KEY: ${{ secrets.NASS_API_KEY }}
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import os, time, urllib.request, urllib.parse
+          UA = {"User-Agent": "kaim-research/1.0"}
+          key = os.environ.get("NASS_API_KEY", "")
+          log = open("out/log.txt", "w")
+          def get(fn, u):
+              for a in range(4):
+                  try:
+                      r = urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=180).read()
+                      open("out/" + fn, "wb").write(r); log.write("%s ok %d bytes\n" % (fn, len(r))); return
+                  except Exception as e:
+                      log.write("%s attempt %d %s\n" % (fn, a, repr(e)[:120])); time.sleep(10 * (a + 1))
+          base = "https://quickstats.nass.usda.gov/api/api_GET/?key=%s&format=JSON&commodity_desc=WHEAT&statisticcat_desc=PRICE+RECEIVED&agg_level_desc=NATIONAL&year__GE=1908" % key
+          get("nass_wheat_price_annual.json", base + "&freq_desc=ANNUAL&unit_desc=%24+%2F+BU")
+          get("nass_wheat_price_monthly.json", base + "&freq_desc=MONTHLY&unit_desc=%24+%2F+BU")
+          get("nass_wheat_price_marketing_year.json", base + "&freq_desc=ANNUAL&reference_period_desc=MARKETING+YEAR")
+          get("fred_CPIAUCNS.csv", "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCNS&cosd=1913-01-01")
+          get("fred_AHETPI.csv", "https://fred.stlouisfed.org/graph/fredgraph.csv?id=AHETPI&cosd=1964-01-01")
+          get("fred_PWHEAMTUSDM.csv", "https://fred.stlouisfed.org/graph/fredgraph.csv?id=PWHEAMTUSDM&cosd=1980-01-01")
+          get("ers_wheat_data_page.html", "https://www.ers.usda.gov/data-products/wheat-data")
+          log.close()
+          PY
+          python3 q.py || true
+          ls -la out
+          cat out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: famine-wheat-penny1
+          path: out/
 
