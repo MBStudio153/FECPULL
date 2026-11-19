@@ -1,1 +1,49 @@
+name: conquest-leaders1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Leaders, elections and official religion (probe of source pages and files)
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import time, urllib.request, json
+          UA = {"User-Agent": "kaim-research/1.0"}
+          log = open("out/log.txt", "w")
+          U = {
+            # probes: some of these may be pages, not data files; the log shows what each returned
+            "archigos_page.html": "https://www.ksgleditsch.com/archigos.html",
+            "archigos_4.1.dta": "https://www.ksgleditsch.com/data/Archigos_4.1_stata14.dta",
+            "parlgov_page.html": "https://www.parlgov.org/data-info/",
+            "parlgov_election.csv": "https://www.parlgov.org/data/parlgov-development_csv-utf-8/view_election.csv",
+            "parlgov_cabinet.csv": "https://www.parlgov.org/data/parlgov-development_csv-utf-8/view_cabinet.csv",
+            "parlgov_party.csv": "https://www.parlgov.org/data/parlgov-development_csv-utf-8/view_party.csv",
+            "ipu_parline_page.html": "https://data.ipu.org/",
+            "ccp_download_page.html": "https://comparativeconstitutionsproject.org/download-data/",
+            "ras_arda_page.html": "https://www.thearda.com/data-archive?fid=RASNAT",
+            "ras_arda_download.html": "https://www.thearda.com/data-archive/browse-categories?cid=RAS",
+            "state_irf_page.html": "https://www.state.gov/international-religious-freedom-reports/",
+          }
+          for fn, u in U.items():
+              for a in range(4):
+                  try:
+                      r = urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=180).read()
+                      open("out/" + fn, "wb").write(r)
+                      log.write("%s ok %d bytes\n" % (fn, len(r))); break
+                  except Exception as e:
+                      log.write("%s attempt %d %s\n" % (fn, a, repr(e)[:120])); time.sleep(10 * (a + 1))
+              log.flush(); time.sleep(2)
+          PY
+          python3 q.py || true
+          ls -la out
+          cat out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conquest-leaders1
+          path: out/
 
