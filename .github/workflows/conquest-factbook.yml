@@ -1,1 +1,68 @@
+name: conquest-factbook1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: World Factbook government sections from the public mirror, by year-end snapshot
+        run: |
+          mkdir -p out work
+          cd work
+          git clone --filter=blob:none --no-checkout https://github.com/factbook/factbook.json.git fb 2>&1 | tail -3 | tee ../out/log.txt
+          cd fb
+          git log --format='%H %cs' > ../../out/commits.txt
+          wc -l ../../out/commits.txt >> ../../out/log.txt
+          tail -2 ../../out/commits.txt >> ../../out/log.txt
+          cd ../..
+          cat > pick.py <<'PY'
+          import subprocess, json, os, glob, sys
+          rows = [l.split() for l in open("out/commits.txt") if l.strip()]   # newest first: sha, date
+          # latest commit on or before each year-end
+          snaps = {}
+          for y in range(2008, 2027):
+              cut = "%d-12-31" % y
+              for sha, d in rows:
+                  if d <= cut:
+                      snaps[y] = (sha, d); break
+          json.dump(snaps, open("out/snapshots.json", "w"), indent=1)
+          print(snaps)
+          PY
+          python3 pick.py >> out/log.txt 2>&1
+          cat > grab.py <<'PY'
+          import subprocess, json, os, glob
+          snaps = json.load(open("out/snapshots.json"))
+          done = set()
+          for y, (sha, d) in sorted(snaps.items()):
+              if sha in done: continue
+              done.add(sha)
+              r = subprocess.run(["git", "-C", "work/fb", "checkout", "-q", sha], capture_output=True, text=True)
+              if r.returncode: print(y, "checkout failed", r.stderr[:200]); continue
+              res = {}
+              for f in glob.glob("work/fb/*/*.json"):
+                  try:
+                      j = json.load(open(f))
+                  except Exception:
+                      continue
+                  code = os.path.basename(f)[:-5]
+                  g = j.get("Government") or {}
+                  keep = {k: g.get(k) for k in ("Country name", "Government type", "Executive branch", "Legislative branch", "Independence", "Constitution", "Political parties and leaders", "Suffrage", "International law organization participation", "Judicial branch") if k in g}
+                  if not keep:
+                      continue
+                  keep["region"] = f.split("/")[2]
+                  res[code] = keep
+              out = "out/factbook_government_%s_%s.json" % (y, d)
+              json.dump(res, open(out, "w"))
+              print(y, d, sha[:8], len(res), "countries")
+          PY
+          python3 grab.py >> out/log.txt 2>&1 || true
+          ls -la out
+          cat out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conquest-factbook1
+          path: out/
 
