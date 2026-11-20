@@ -1,1 +1,68 @@
+name: gdelt-gaps-retry1
+on: workflow_dispatch
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include: [{"term": "municipal bankruptcy", "tag": "municipal_bankruptcy", "grp": "munibankruptcy", "query": "\"municipal bankruptcy\"", "years": "2020", "ytag": "2020"}, {"term": "municipal bankruptcy", "tag": "municipal_bankruptcy", "grp": "munibankruptcy", "query": "\"municipal bankruptcy\"", "years": "2021", "ytag": "2021"}, {"term": "municipal bankruptcy", "tag": "municipal_bankruptcy", "grp": "munibankruptcy", "query": "\"municipal bankruptcy\"", "years": "2022", "ytag": "2022"}, {"term": "municipal bankruptcy", "tag": "municipal_bankruptcy", "grp": "munibankruptcy", "query": "\"municipal bankruptcy\"", "years": "2023", "ytag": "2023"}, {"term": "municipal bankruptcy", "tag": "municipal_bankruptcy", "grp": "munibankruptcy", "query": "\"municipal bankruptcy\"", "years": "2024", "ytag": "2024"}, {"term": "municipal bankruptcy", "tag": "municipal_bankruptcy", "grp": "munibankruptcy", "query": "\"municipal bankruptcy\"", "years": "2025", "ytag": "2025"}, {"term": "municipal bankruptcy", "tag": "municipal_bankruptcy", "grp": "munibankruptcy", "query": "\"municipal bankruptcy\"", "years": "2026", "ytag": "2026"}, {"term": "drone strike", "tag": "drone_strike", "grp": "dronestrike", "query": "\"drone strike\"", "years": "2025", "ytag": "2025"}, {"term": "drone strike", "tag": "drone_strike", "grp": "dronestrike", "query": "\"drone strike\"", "years": "2026", "ytag": "2026"}, {"term": "alec model bill", "tag": "alec_model_bill", "grp": "alec", "query": "\"ALEC\" \"model bill\"", "years": "2025", "ytag": "2025"}, {"term": "opinion poll", "tag": "opinion_poll", "grp": "opinionpoll", "query": "\"opinion poll\"", "years": "2018", "ytag": "2018"}]
+    steps:
+      - name: GDELT DOC API, executive order tariffs, 2017 and 2023, patient retry
+        continue-on-error: true
+        env:
+          TERM_: ${{ matrix.term }}
+          QUERY_: ${{ matrix.query }}
+          YEARS_: ${{ matrix.years }}
+          GRP_: ${{ matrix.grp }}
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import os, re, time, urllib.request, urllib.parse
+          term = os.environ["TERM_"]
+          slug = re.sub("[^a-z0-9]+", "_", term.lower()).strip("_")
+          log = open("out/log.txt", "w")
+          time.sleep(300)
+          q = os.environ["QUERY_"] + " sourcelang:english"
+          for yr in [int(y) for y in os.environ["YEARS_"].split(",")]:
+              start = "%d0101000000" % yr
+              end = time.strftime("%Y%m%d235959") if yr >= 2026 else "%d1231235959" % yr
+              params = {"query": q, "mode": "timelinevolraw", "format": "json", "timelinesmooth": "0", "startdatetime": start, "enddatetime": end}
+              url = "https://api.gdeltproject.org/api/v2/doc/doc?" + urllib.parse.urlencode(params)
+              err = ""
+              for a in range(14):
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": "kaim-research/1.0"})
+                      r = urllib.request.urlopen(req, timeout=180).read().decode("utf-8", "replace")
+                      if r.startswith("{"):
+                          open("out/topic_%s__%s_%d.json" % (os.environ["GRP_"], slug, yr), "w").write(r)
+                          log.write("%s %d ok len=%d\n" % (slug, yr, len(r))); log.flush()
+                          break
+                      err = r[:80]
+                      if "too short" in r or "too long" in r:
+                          log.write("%s %d STOP phrase rejected: %s\n" % (slug, yr, err)); log.flush()
+                          raise SystemExit(1)
+                  except SystemExit:
+                      raise
+                  except Exception as e:
+                      err = repr(e)[:120]
+                  log.write("%s %d attempt %d %s\n" % (slug, yr, a, err)); log.flush()
+                  time.sleep(900)
+              time.sleep(90)
+          log.close()
+          PY
+          python3 q.py
+      - name: Name the artifact
+        if: always()
+        run: echo "ART=${TAG_}" >> $GITHUB_ENV
+        env:
+          TERM_: ${{ matrix.term }}
+          TAG_: ${{ matrix.tag }}_${{ matrix.ytag }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gdelt-gaps-retry1-${{ env.ART }}
+          path: out/
 
