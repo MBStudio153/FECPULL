@@ -1,1 +1,66 @@
+name: famine-wheat-penny2
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: FRED CPI and wage series for the wheat and penny rows
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import os, time, urllib.request, json
+          key = os.environ.get("FRED_API_KEY", "")
+          log = open("out/log.txt", "w")
+          log.write("key present: %s\n" % bool(key)); log.flush()
+          ids = [
+            "CPIAUCNS",          # CPI all urban, not seasonally adjusted, 1913 on
+            "CPIAUCSL",          # CPI all urban, seasonally adjusted, 1947 on
+            "AHETPI",            # avg hourly earnings, production and nonsupervisory, 1964 on
+            "CES0500000003",     # avg hourly earnings, all private employees, 2006 on
+            "PWHEAMTUSDM",       # global wheat price, US dollars per metric ton, 1980 on
+            "WPU0121",           # PPI wheat
+            "A0175CUSA027NBEA",  # (may not exist) probe
+          ]
+          for sid in ids:
+              u = "https://api.stlouisfed.org/fred/series/observations?series_id=%s&api_key=%s&file_type=json" % (sid, key)
+              for a in range(3):
+                  try:
+                      r = urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": "kaim-research/1.0"}), timeout=120).read()
+                      d = json.loads(r)
+                      open("out/fred_%s.json" % sid, "wb").write(r)
+                      obs = d.get("observations", [])
+                      log.write("%s ok %d obs, first %s last %s\n" % (sid, len(obs), obs[0]["date"] if obs else "-", obs[-1]["date"] if obs else "-"))
+                      break
+                  except Exception as e:
+                      log.write("%s attempt %d %s\n" % (sid, a, repr(e)[:150])); time.sleep(5 * (a + 1))
+              log.flush()
+              # series info (title, units, notes) for citation
+              try:
+                  u2 = "https://api.stlouisfed.org/fred/series?series_id=%s&api_key=%s&file_type=json" % (sid, key)
+                  open("out/info_%s.json" % sid, "wb").write(urllib.request.urlopen(u2, timeout=60).read())
+              except Exception as e:
+                  log.write("%s info %s\n" % (sid, repr(e)[:100]))
+          # search for earlier wage series (1900s-1960s) to cover 1908 on
+          for q in ["average hourly earnings manufacturing", "hourly earnings production workers 1909"]:
+              try:
+                  u = "https://api.stlouisfed.org/fred/series/search?search_text=%s&api_key=%s&file_type=json&limit=40&order_by=popularity&sort_order=desc" % (q.replace(" ", "+"), key)
+                  open("out/search_%s.json" % q.replace(" ", "_"), "wb").write(urllib.request.urlopen(u, timeout=60).read())
+                  log.write("search %s ok\n" % q)
+              except Exception as e:
+                  log.write("search %s %s\n" % (q, repr(e)[:100]))
+          log.close()
+          PY
+          python3 q.py || true
+          ls -la out
+          cat out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: famine-wheat-penny2
+          path: out/
 
