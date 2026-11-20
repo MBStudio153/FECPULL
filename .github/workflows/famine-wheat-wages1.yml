@@ -1,1 +1,53 @@
+name: famine-wheat-wages1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: FRED early wage series (1890 to 1963) to extend the wheat day-wage row
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import os, time, urllib.request, json
+          key = os.environ.get("FRED_API_KEY", "")
+          log = open("out/log.txt", "w")
+          log.write("key present: %s\n" % bool(key)); log.flush()
+          ids = [
+            "A0850AUSA052NNBR",  # hourly money earnings, payroll manufacturing, annual, 1890 on
+            "A0850BUSA052NNBR",  # same, alternate series, 1920 on
+            "A08140USA052NNBR",  # laborers average daily rate of wages, annual, 1860 on
+            "M08142USM055NNBR",  # hourly earnings, 25 manufacturing industries, monthly, 1920 on
+            "AHEMAN",            # hourly earnings, production workers, manufacturing, 1939 on
+            "CES3000000008",     # same family, current BLS series, 1939 on
+          ]
+          base = "https://api.stlouisfed.org/fred/"
+          for sid in ids:
+              for kind, fn in (("series/observations", "fred_%s.json"), ("series", "info_%s.json")):
+                  u = "%s%s?series_id=%s&api_key=%s&file_type=json" % (base, kind, sid, key)
+                  for a in range(3):
+                      try:
+                          r = urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": "kaim-research/1.0"}), timeout=120).read()
+                          open("out/" + fn % sid, "wb").write(r)
+                          if kind == "series/observations":
+                              obs = json.loads(r).get("observations", [])
+                              log.write("%s ok %d obs, %s to %s\n" % (sid, len(obs), obs[0]["date"] if obs else "-", obs[-1]["date"] if obs else "-"))
+                          break
+                      except Exception as e:
+                          log.write("%s %s attempt %d %s\n" % (sid, kind, a, repr(e)[:150])); time.sleep(5 * (a + 1))
+                  log.flush()
+          log.close()
+          PY
+          python3 q.py || true
+          ls -la out
+          cat out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: famine-wheat-wages1
+          path: out/
 
