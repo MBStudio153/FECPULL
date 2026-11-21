@@ -1,1 +1,45 @@
+name: conquest-autocracy2
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: World Bank governance indicators and Polity5 regime scores, plus population
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import time, urllib.request, json
+          UA = {"User-Agent": "kaim-research/1.0"}
+          log = open("out/log.txt", "w")
+          U = {
+            "wgi_voice_accountability_est.json": "https://api.worldbank.org/v2/country/all/indicator/VA.EST?format=json&per_page=20000&date=1996:2025&source=3",
+            "wgi_voice_accountability_rank.json": "https://api.worldbank.org/v2/country/all/indicator/VA.PER.RNK?format=json&per_page=20000&date=1996:2025&source=3",
+            "wgi_political_stability_est.json": "https://api.worldbank.org/v2/country/all/indicator/PV.EST?format=json&per_page=20000&date=1996:2025&source=3",
+            "wgi_rule_of_law_est.json": "https://api.worldbank.org/v2/country/all/indicator/RL.EST?format=json&per_page=20000&date=1996:2025&source=3",
+            "wdi_population.json": "https://api.worldbank.org/v2/country/all/indicator/SP.POP.TOTL?format=json&per_page=20000&date=1960:2025",
+            "wdi_countries.json": "https://api.worldbank.org/v2/country?format=json&per_page=400",
+            "polity5_2018.xls": "http://www.systemicpeace.org/inscr/p5v2018.xls",
+            "polity5_2018.sav": "http://www.systemicpeace.org/inscr/p5v2018.sav",
+          }
+          for fn, u in U.items():
+              for a in range(4):
+                  try:
+                      r = urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=180).read()
+                      open("out/" + fn, "wb").write(r)
+                      log.write("%s ok %d bytes\n" % (fn, len(r))); break
+                  except Exception as e:
+                      log.write("%s attempt %d %s\n" % (fn, a, repr(e)[:120])); time.sleep(10 * (a + 1))
+              log.flush(); time.sleep(2)
+          PY
+          python3 q.py || true
+          ls -la out
+          cat out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conquest-autocracy2
+          path: out/
 
