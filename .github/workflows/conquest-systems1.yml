@@ -1,1 +1,45 @@
+name: conquest-systems1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Government size, systems and political economy (World Bank, FRED)
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import time, urllib.request, json
+          UA = {"User-Agent": "kaim-research/1.0"}
+          log = open("out/log.txt", "w")
+          U = {
+            "wdi_gov_expense_gdp.json": "https://api.worldbank.org/v2/country/all/indicator/GC.XPN.TOTL.GD.ZS?format=json&per_page=20000&date=1960:2025",
+            "wdi_gov_consumption_gdp.json": "https://api.worldbank.org/v2/country/all/indicator/NE.CON.GOVT.ZS?format=json&per_page=20000&date=1960:2025",
+            "wdi_tax_rev_gdp.json": "https://api.worldbank.org/v2/country/all/indicator/GC.TAX.TOTL.GD.ZS?format=json&per_page=20000&date=1960:2025",
+            "wdi_private_credit_gdp.json": "https://api.worldbank.org/v2/country/all/indicator/FS.AST.PRVT.GD.ZS?format=json&per_page=20000&date=1960:2025",
+            "fred_FYONGDA188S.csv": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=FYONGDA188S&cosd=1929-01-01",
+            "fred_FYFRGDA188S.csv": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=FYFRGDA188S&cosd=1929-01-01",
+            "fred_GEXPND.csv": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=GEXPND&cosd=1947-01-01",
+            "vparty_page.html": "https://www.v-dem.net/data/v-party-dataset/"
+          }
+          for fn, u in U.items():
+              for a in range(4):
+                  try:
+                      r = urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=180).read()
+                      open("out/" + fn, "wb").write(r)
+                      log.write("%s ok %d bytes\n" % (fn, len(r))); break
+                  except Exception as e:
+                      log.write("%s attempt %d %s\n" % (fn, a, repr(e)[:120])); time.sleep(10 * (a + 1))
+              log.flush(); time.sleep(1)
+          PY
+          python3 q.py || true
+          ls -la out
+          cat out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conquest-systems1
+          path: out/
 
