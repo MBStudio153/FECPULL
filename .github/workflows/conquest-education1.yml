@@ -1,1 +1,46 @@
+name: conquest-education1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Education, literacy and enrollment (World Bank, NCES)
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import time, urllib.request, json
+          UA = {"User-Agent": "kaim-research/1.0"}
+          log = open("out/log.txt", "w")
+          U = {
+            "wdi_tertiary_enrollment.json": "https://api.worldbank.org/v2/country/all/indicator/SE.TER.ENRR?format=json&per_page=20000&date=1960:2025",
+            "wdi_adult_literacy.json": "https://api.worldbank.org/v2/country/all/indicator/SE.ADT.LITR.ZS?format=json&per_page=20000&date=1960:2025",
+            "wdi_youth_literacy.json": "https://api.worldbank.org/v2/country/all/indicator/SE.ADT.1524.LT.ZS?format=json&per_page=20000&date=1960:2025",
+            "wdi_primary_completion.json": "https://api.worldbank.org/v2/country/all/indicator/SE.PRM.CMPT.ZS?format=json&per_page=20000&date=1960:2025",
+            "wdi_public_edu_spend_gdp.json": "https://api.worldbank.org/v2/country/all/indicator/SE.XPD.TOTL.GD.ZS?format=json&per_page=20000&date=1960:2025",
+            "nces_tabn303.70.xlsx": "https://nces.ed.gov/programs/digest/d23/tables/xls/tabn303.70.xlsx",
+            "nces_tabn303.10.xlsx": "https://nces.ed.gov/programs/digest/d23/tables/xls/tabn303.10.xlsx",
+            "nces_tabn330.10.xlsx": "https://nces.ed.gov/programs/digest/d23/tables/xls/tabn330.10.xlsx",
+            "nces_tabn302.10.xlsx": "https://nces.ed.gov/programs/digest/d23/tables/xls/tabn302.10.xlsx"
+          }
+          for fn, u in U.items():
+              for a in range(4):
+                  try:
+                      r = urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=180).read()
+                      open("out/" + fn, "wb").write(r)
+                      log.write("%s ok %d bytes\n" % (fn, len(r))); break
+                  except Exception as e:
+                      log.write("%s attempt %d %s\n" % (fn, a, repr(e)[:120])); time.sleep(10 * (a + 1))
+              log.flush(); time.sleep(1)
+          PY
+          python3 q.py || true
+          ls -la out
+          cat out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conquest-education1
+          path: out/
 
