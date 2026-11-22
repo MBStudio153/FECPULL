@@ -1,1 +1,51 @@
+name: conquest-techjobs1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Tech-sector unemployment, layoffs and employment from FRED (BLS series), monthly
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import time, urllib.request
+          UA = {"User-Agent": "kaim-research/1.0"}
+          log = open("out/log.txt", "w")
+          S = {
+            "LNU04032237": "Unemployment rate, Information industry, private wage and salary workers, NSA (BLS CPS)",
+            "LNU03032237": "Unemployment level, Information industry, private wage and salary workers, thousands, NSA (BLS CPS)",
+            "LNS14000000": "Unemployment rate, all workers, seasonally adjusted (BLS CPS), comparison",
+            "LNU04000000": "Unemployment rate, all workers, not seasonally adjusted (BLS CPS), comparison",
+            "JTU5100LDL": "Layoffs and discharges, Information, thousands, NSA (BLS JOLTS)",
+            "JTU5100LDR": "Layoffs and discharges rate, Information, NSA (BLS JOLTS)",
+            "JTS5100LDL": "Layoffs and discharges, Information, thousands, SA (BLS JOLTS)",
+            "JTU510000JOL": "Job openings, Information, thousands, NSA (BLS JOLTS)",
+            "JTU000000LDL": "Layoffs and discharges, total nonfarm, thousands, NSA (BLS JOLTS), comparison",
+            "CES5000000001": "All employees, Information sector, thousands, SA (BLS CES)",
+            "CES6054150001": "All employees, Computer systems design and related services, thousands, SA (BLS CES)",
+            "CES5051800001": "All employees, Computing infrastructure providers, data processing, web hosting, thousands (BLS CES; may not exist)",
+            "CES5051200001": "All employees, Motion picture and sound recording, thousands (BLS CES), comparison",
+          }
+          for sid, desc in S.items():
+              u = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=%s&cosd=2000-01-01" % sid
+              for a in range(4):
+                  try:
+                      r = urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=120).read().decode()
+                      open("out/%s.csv" % sid, "w").write(r)
+                      log.write("%s ok %d lines | %s\n" % (sid, r.count("\n"), desc)); break
+                  except Exception as e:
+                      log.write("%s attempt %d %s\n" % (sid, a, repr(e)[:100])); time.sleep(10 * (a + 1))
+              log.flush(); time.sleep(2)
+          PY
+          python3 q.py || true
+          ls -la out
+          cat out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conquest-techjobs1
+          path: out/
 
