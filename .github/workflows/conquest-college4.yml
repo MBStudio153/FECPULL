@@ -1,1 +1,49 @@
+name: conquest-college4
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 7
+      matrix:
+        year: [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023]
+    env:
+      YEAR: ${{ matrix.year }}
+    steps:
+      - name: "IPEDS fall enrollment (EF A) and institution directory (HD) for one year"
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import os, time, zipfile, io, urllib.request
+          UA = {"User-Agent": "Mozilla/5.0 kaim-research/1.0"}
+          y = os.environ["YEAR"]
+          log = open("out/log.txt", "w")
+          base = "https://nces.ed.gov/ipeds/datacenter/data/"
+          for name in ("EF%sA" % y, "HD%s" % y):
+              ok = False
+              for a in range(3):
+                  try:
+                      r = urllib.request.urlopen(urllib.request.Request(base + name + ".zip", headers=UA), timeout=120).read()
+                      z = zipfile.ZipFile(io.BytesIO(r))
+                      for n in z.namelist():
+                          open("out/" + n, "wb").write(z.read(n))
+                      log.write("%s ok %d bytes | %s\n" % (name, len(r), ", ".join(z.namelist()))); ok = True; break
+                  except Exception as e:
+                      log.write("%s attempt %d %s\n" % (name, a, repr(e)[:160])); time.sleep(10 * (a + 1))
+              if not ok:
+                  log.write("%s FAILED, no file saved\n" % name)
+              log.flush()
+          PY
+          python3 q.py || true
+          ls -la out
+          cat out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conquest-college4-${{ matrix.year }}
+          path: out/
 
