@@ -1,1 +1,51 @@
+name: conquest-college1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: IPEDS fall enrollment and institution directory, 2024 and 2025 (NCES, public)
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import time, urllib.request, zipfile, io
+          UA = {"User-Agent": "kaim-research/1.0"}
+          base = "https://nces.ed.gov/ipeds/datacenter/data/"
+          # every file name is tried; the ones that do not exist are logged, not dropped silently
+          names = []
+          for yr in (2024, 2025):
+              for stem in ("HD%d", "EF%dA", "EF%dA_RV", "EF%dB", "EF%dC", "EF%dCP", "EF%dD", "EFIA%d", "EFFY%d", "IC%d"):
+                  names.append(stem % yr)
+          # earlier years for context in the same files
+          for yr in (2022, 2023):
+              names += ["HD%d" % yr, "EF%dA" % yr]
+          log = open("out/log.txt", "w")
+          for n in names:
+              u = base + n + ".zip"
+              ok = False
+              for a in range(3):
+                  try:
+                      r = urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=120).read()
+                      open("out/%s.zip" % n, "wb").write(r)
+                      z = zipfile.ZipFile(io.BytesIO(r))
+                      log.write("%s ok %d bytes | %s\n" % (n, len(r), ", ".join(z.namelist()))); ok = True
+                      break
+                  except Exception as e:
+                      msg = repr(e)[:100]
+                      if "404" in msg:
+                          log.write("%s not found (404)\n" % n); break
+                      log.write("%s attempt %d %s\n" % (n, a, msg)); time.sleep(10 * (a + 1))
+              log.flush(); time.sleep(1)
+          PY
+          python3 q.py || true
+          ls -la out
+          cat out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conquest-college1
+          path: out/
 
