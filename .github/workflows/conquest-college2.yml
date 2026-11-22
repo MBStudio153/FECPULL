@@ -1,1 +1,79 @@
+name: conquest-college2
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: IPEDS Data Center, find and download fall enrollment 2024 and 2025 (NCES, public)
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import re, time, urllib.request, zipfile, io
+          UA = {"User-Agent": "Mozilla/5.0 (compatible; kaim-research/1.0)"}
+          log = open("out/log.txt", "w")
+          def get(u, tries=3):
+              for a in range(tries):
+                  try:
+                      return urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=120).read()
+                  except Exception as e:
+                      m = repr(e)[:100]
+                      if "404" in m:
+                          return None
+                      log.write("  %s attempt %d %s\n" % (u, a, m)); log.flush(); time.sleep(10 * (a + 1))
+              return None
+          # 1) read the Data Center pages and list every zip link they hold
+          found = set()
+          pages = [
+              "https://nces.ed.gov/ipeds/datacenter/DataFiles.aspx",
+              "https://nces.ed.gov/ipeds/datacenter/DataFiles.aspx?year=2024",
+              "https://nces.ed.gov/ipeds/datacenter/DataFiles.aspx?year=2025",
+              "https://nces.ed.gov/ipeds/use-the-data",
+              "https://nces.ed.gov/ipeds/use-the-data/download-access-database",
+          ]
+          for p in pages:
+              h = get(p)
+              if h is None:
+                  log.write("page not read: %s\n" % p); continue
+              t = h.decode("latin1")
+              open("out/page_%d.html" % pages.index(p), "w").write(t)
+              links = set(re.findall(r'href="([^"]+\.zip)"', t, re.I))
+              log.write("page %s read, %d zip links\n" % (p, len(links)))
+              for l in links:
+                  if l.startswith("/"): l = "https://nces.ed.gov" + l
+                  elif not l.startswith("http"): l = "https://nces.ed.gov/ipeds/datacenter/" + l.lstrip("./")
+                  found.add(l)
+          log.write("ZIP LINKS FOUND:\n" + "\n".join(sorted(found)) + "\n"); log.flush()
+          # 2) guess file names too, and keep whatever exists
+          base = "https://nces.ed.gov/ipeds/datacenter/data/"
+          cands = set()
+          for yr in (2023, 2024, 2025):
+              for stem in ("EF%dA", "EF%dA_RV", "EF%dA_DIST", "EF%dB", "EF%dC", "EF%dD", "HD%d", "IC%d"):
+                  cands.add(base + (stem % yr) + ".zip")
+                  cands.add(base + (stem % yr).lower() + ".zip")
+          for l in found:
+              if re.search(r"(EF|HD)(2023|2024|2025)", l, re.I):
+                  cands.add(l)
+          for u in sorted(cands):
+              r = get(u)
+              if r is None:
+                  log.write("not found: %s\n" % u); log.flush(); continue
+              name = u.rsplit("/", 1)[1]
+              open("out/" + name, "wb").write(r)
+              try:
+                  log.write("OK %s %d bytes | %s\n" % (name, len(r), ", ".join(zipfile.ZipFile(io.BytesIO(r)).namelist())))
+              except Exception:
+                  log.write("OK %s %d bytes (not a zip)\n" % (name, len(r)))
+              log.flush(); time.sleep(1)
+          PY
+          python3 q.py || true
+          ls -la out
+          cat out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conquest-college2
+          path: out/
 
