@@ -1,1 +1,37 @@
+name: conquest-college3
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: "IPEDS 2024-25 provisional database, export fall 2024 enrollment tables (NCES, public)"
+        run: |
+          mkdir -p out db
+          sudo apt-get update -qq && sudo apt-get install -y -qq mdbtools unzip
+          U="https://nces.ed.gov/ipeds/tablefiles/zipfiles/IPEDS_2024-25_Provisional.zip"
+          for i in 1 2 3; do
+            curl -sS -L -A "Mozilla/5.0 (compatible; kaim-research/1.0)" -o db/p.zip "$U" && break
+            echo "download attempt $i failed" >> out/log.txt; sleep 20
+          done
+          ls -la db >> out/log.txt
+          unzip -o -q db/p.zip -d db || echo "unzip failed" >> out/log.txt
+          find db -type f ! -name p.zip -exec ls -la {} \; >> out/log.txt
+          F=$(find db -iname '*.accdb' -o -iname '*.mdb' | head -1)
+          echo "database file: $F" >> out/log.txt
+          mdb-tables -1 "$F" > out/tables.txt 2>>out/log.txt || true
+          wc -l out/tables.txt >> out/log.txt
+          # fall enrollment and directory tables for 2024 and 2025 if present, plus the data dictionary tables
+          for T in $(grep -iE '^(EF2024|EF2025|HD2024|HD2025|IC2024|IC2025|vartable|valuesets|tables)' out/tables.txt); do
+            mdb-export "$F" "$T" > "out/$T.csv" 2>>out/log.txt && echo "exported $T $(wc -l < out/$T.csv) lines" >> out/log.txt
+          done
+          ls -la out
+          cat out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conquest-college3
+          path: out/
 
