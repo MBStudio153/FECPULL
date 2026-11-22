@@ -1,1 +1,68 @@
+name: gdelt-cyber2
+on: workflow_dispatch
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        include: [{"term": "cybercrime", "tag": "cybercrime", "grp": "cyber", "query": "\"cybercrime\"", "years": "2017", "ytag": "2017"}, {"term": "cybercrime", "tag": "cybercrime", "grp": "cyber", "query": "\"cybercrime\"", "years": "2018", "ytag": "2018"}, {"term": "cybercrime", "tag": "cybercrime", "grp": "cyber", "query": "\"cybercrime\"", "years": "2019", "ytag": "2019"}, {"term": "cybercrime", "tag": "cybercrime", "grp": "cyber", "query": "\"cybercrime\"", "years": "2020", "ytag": "2020"}, {"term": "cybercrime", "tag": "cybercrime", "grp": "cyber", "query": "\"cybercrime\"", "years": "2021", "ytag": "2021"}, {"term": "cybercrime", "tag": "cybercrime", "grp": "cyber", "query": "\"cybercrime\"", "years": "2022", "ytag": "2022"}, {"term": "cybercrime", "tag": "cybercrime", "grp": "cyber", "query": "\"cybercrime\"", "years": "2023", "ytag": "2023"}, {"term": "cybercrime", "tag": "cybercrime", "grp": "cyber", "query": "\"cybercrime\"", "years": "2024", "ytag": "2024"}, {"term": "cybercrime", "tag": "cybercrime", "grp": "cyber", "query": "\"cybercrime\"", "years": "2025", "ytag": "2025"}, {"term": "cybercrime", "tag": "cybercrime", "grp": "cyber", "query": "\"cybercrime\"", "years": "2026", "ytag": "2026"}, {"term": "ransomware", "tag": "ransomware", "grp": "cyber", "query": "\"ransomware\"", "years": "2017", "ytag": "2017"}, {"term": "ransomware", "tag": "ransomware", "grp": "cyber", "query": "\"ransomware\"", "years": "2018", "ytag": "2018"}, {"term": "ransomware", "tag": "ransomware", "grp": "cyber", "query": "\"ransomware\"", "years": "2019", "ytag": "2019"}, {"term": "ransomware", "tag": "ransomware", "grp": "cyber", "query": "\"ransomware\"", "years": "2020", "ytag": "2020"}, {"term": "ransomware", "tag": "ransomware", "grp": "cyber", "query": "\"ransomware\"", "years": "2021", "ytag": "2021"}, {"term": "ransomware", "tag": "ransomware", "grp": "cyber", "query": "\"ransomware\"", "years": "2022", "ytag": "2022"}, {"term": "ransomware", "tag": "ransomware", "grp": "cyber", "query": "\"ransomware\"", "years": "2023", "ytag": "2023"}, {"term": "ransomware", "tag": "ransomware", "grp": "cyber", "query": "\"ransomware\"", "years": "2024", "ytag": "2024"}, {"term": "ransomware", "tag": "ransomware", "grp": "cyber", "query": "\"ransomware\"", "years": "2025", "ytag": "2025"}, {"term": "ransomware", "tag": "ransomware", "grp": "cyber", "query": "\"ransomware\"", "years": "2026", "ytag": "2026"}, {"term": "data breach", "tag": "data_breach", "grp": "cyber", "query": "\"data breach\"", "years": "2017", "ytag": "2017"}, {"term": "data breach", "tag": "data_breach", "grp": "cyber", "query": "\"data breach\"", "years": "2018", "ytag": "2018"}, {"term": "data breach", "tag": "data_breach", "grp": "cyber", "query": "\"data breach\"", "years": "2019", "ytag": "2019"}, {"term": "data breach", "tag": "data_breach", "grp": "cyber", "query": "\"data breach\"", "years": "2020", "ytag": "2020"}, {"term": "data breach", "tag": "data_breach", "grp": "cyber", "query": "\"data breach\"", "years": "2021", "ytag": "2021"}, {"term": "data breach", "tag": "data_breach", "grp": "cyber", "query": "\"data breach\"", "years": "2022", "ytag": "2022"}, {"term": "data breach", "tag": "data_breach", "grp": "cyber", "query": "\"data breach\"", "years": "2023", "ytag": "2023"}, {"term": "data breach", "tag": "data_breach", "grp": "cyber", "query": "\"data breach\"", "years": "2024", "ytag": "2024"}, {"term": "data breach", "tag": "data_breach", "grp": "cyber", "query": "\"data breach\"", "years": "2025", "ytag": "2025"}, {"term": "data breach", "tag": "data_breach", "grp": "cyber", "query": "\"data breach\"", "years": "2026", "ytag": "2026"}, {"term": "cyberattack", "tag": "cyberattack", "grp": "cyber", "query": "\"cyberattack\"", "years": "2017", "ytag": "2017"}, {"term": "cyberattack", "tag": "cyberattack", "grp": "cyber", "query": "\"cyberattack\"", "years": "2018", "ytag": "2018"}, {"term": "cyberattack", "tag": "cyberattack", "grp": "cyber", "query": "\"cyberattack\"", "years": "2019", "ytag": "2019"}, {"term": "cyberattack", "tag": "cyberattack", "grp": "cyber", "query": "\"cyberattack\"", "years": "2020", "ytag": "2020"}, {"term": "cyberattack", "tag": "cyberattack", "grp": "cyber", "query": "\"cyberattack\"", "years": "2021", "ytag": "2021"}, {"term": "cyberattack", "tag": "cyberattack", "grp": "cyber", "query": "\"cyberattack\"", "years": "2022", "ytag": "2022"}, {"term": "cyberattack", "tag": "cyberattack", "grp": "cyber", "query": "\"cyberattack\"", "years": "2023", "ytag": "2023"}, {"term": "cyberattack", "tag": "cyberattack", "grp": "cyber", "query": "\"cyberattack\"", "years": "2024", "ytag": "2024"}, {"term": "cyberattack", "tag": "cyberattack", "grp": "cyber", "query": "\"cyberattack\"", "years": "2025", "ytag": "2025"}, {"term": "cyberattack", "tag": "cyberattack", "grp": "cyber", "query": "\"cyberattack\"", "years": "2026", "ytag": "2026"}, {"term": "phishing", "tag": "phishing", "grp": "cyber", "query": "\"phishing\"", "years": "2017", "ytag": "2017"}, {"term": "phishing", "tag": "phishing", "grp": "cyber", "query": "\"phishing\"", "years": "2018", "ytag": "2018"}, {"term": "phishing", "tag": "phishing", "grp": "cyber", "query": "\"phishing\"", "years": "2019", "ytag": "2019"}, {"term": "phishing", "tag": "phishing", "grp": "cyber", "query": "\"phishing\"", "years": "2020", "ytag": "2020"}, {"term": "phishing", "tag": "phishing", "grp": "cyber", "query": "\"phishing\"", "years": "2021", "ytag": "2021"}, {"term": "phishing", "tag": "phishing", "grp": "cyber", "query": "\"phishing\"", "years": "2022", "ytag": "2022"}, {"term": "phishing", "tag": "phishing", "grp": "cyber", "query": "\"phishing\"", "years": "2023", "ytag": "2023"}, {"term": "phishing", "tag": "phishing", "grp": "cyber", "query": "\"phishing\"", "years": "2024", "ytag": "2024"}, {"term": "phishing", "tag": "phishing", "grp": "cyber", "query": "\"phishing\"", "years": "2025", "ytag": "2025"}, {"term": "phishing", "tag": "phishing", "grp": "cyber", "query": "\"phishing\"", "years": "2026", "ytag": "2026"}, {"term": "identity theft", "tag": "identity_theft", "grp": "cyber", "query": "\"identity theft\"", "years": "2017", "ytag": "2017"}, {"term": "identity theft", "tag": "identity_theft", "grp": "cyber", "query": "\"identity theft\"", "years": "2018", "ytag": "2018"}, {"term": "identity theft", "tag": "identity_theft", "grp": "cyber", "query": "\"identity theft\"", "years": "2019", "ytag": "2019"}, {"term": "identity theft", "tag": "identity_theft", "grp": "cyber", "query": "\"identity theft\"", "years": "2020", "ytag": "2020"}, {"term": "identity theft", "tag": "identity_theft", "grp": "cyber", "query": "\"identity theft\"", "years": "2021", "ytag": "2021"}, {"term": "identity theft", "tag": "identity_theft", "grp": "cyber", "query": "\"identity theft\"", "years": "2022", "ytag": "2022"}, {"term": "identity theft", "tag": "identity_theft", "grp": "cyber", "query": "\"identity theft\"", "years": "2023", "ytag": "2023"}, {"term": "identity theft", "tag": "identity_theft", "grp": "cyber", "query": "\"identity theft\"", "years": "2024", "ytag": "2024"}, {"term": "identity theft", "tag": "identity_theft", "grp": "cyber", "query": "\"identity theft\"", "years": "2025", "ytag": "2025"}, {"term": "identity theft", "tag": "identity_theft", "grp": "cyber", "query": "\"identity theft\"", "years": "2026", "ytag": "2026"}, {"term": "payment scam", "tag": "payment_scam", "grp": "cyber", "query": "\"payment scam\"", "years": "2017", "ytag": "2017"}, {"term": "payment scam", "tag": "payment_scam", "grp": "cyber", "query": "\"payment scam\"", "years": "2018", "ytag": "2018"}, {"term": "payment scam", "tag": "payment_scam", "grp": "cyber", "query": "\"payment scam\"", "years": "2019", "ytag": "2019"}, {"term": "payment scam", "tag": "payment_scam", "grp": "cyber", "query": "\"payment scam\"", "years": "2020", "ytag": "2020"}, {"term": "payment scam", "tag": "payment_scam", "grp": "cyber", "query": "\"payment scam\"", "years": "2021", "ytag": "2021"}, {"term": "payment scam", "tag": "payment_scam", "grp": "cyber", "query": "\"payment scam\"", "years": "2022", "ytag": "2022"}, {"term": "payment scam", "tag": "payment_scam", "grp": "cyber", "query": "\"payment scam\"", "years": "2023", "ytag": "2023"}, {"term": "payment scam", "tag": "payment_scam", "grp": "cyber", "query": "\"payment scam\"", "years": "2024", "ytag": "2024"}, {"term": "payment scam", "tag": "payment_scam", "grp": "cyber", "query": "\"payment scam\"", "years": "2025", "ytag": "2025"}, {"term": "payment scam", "tag": "payment_scam", "grp": "cyber", "query": "\"payment scam\"", "years": "2026", "ytag": "2026"}]
+    steps:
+      - name: GDELT DOC API, cybercrime terms, one year per job
+        continue-on-error: true
+        env:
+          TERM_: ${{ matrix.term }}
+          QUERY_: ${{ matrix.query }}
+          YEARS_: ${{ matrix.years }}
+          GRP_: ${{ matrix.grp }}
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import os, re, time, urllib.request, urllib.parse
+          term = os.environ["TERM_"]
+          slug = re.sub("[^a-z0-9]+", "_", term.lower()).strip("_")
+          log = open("out/log.txt", "w")
+          import random
+          time.sleep(random.randint(0, 45))
+          q = os.environ["QUERY_"] + " sourcelang:english"
+          for yr in [int(y) for y in os.environ["YEARS_"].split(",")]:
+              start = "%d0101000000" % yr
+              end = time.strftime("%Y%m%d235959") if yr >= 2026 else "%d1231235959" % yr
+              params = {"query": q, "mode": "timelinevolraw", "format": "json", "timelinesmooth": "0", "startdatetime": start, "enddatetime": end}
+              url = "https://api.gdeltproject.org/api/v2/doc/doc?" + urllib.parse.urlencode(params)
+              err = ""
+              for a in range(30):
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": "kaim-research/1.0"})
+                      r = urllib.request.urlopen(req, timeout=180).read().decode("utf-8", "replace")
+                      if r.startswith("{"):
+                          open("out/topic_%s__%s_%d.json" % (os.environ["GRP_"], slug, yr), "w").write(r)
+                          log.write("%s %d ok len=%d\n" % (slug, yr, len(r))); log.flush()
+                          break
+                      err = r[:80]
+                      if "too short" in r or "too long" in r:
+                          log.write("%s %d STOP phrase rejected: %s\n" % (slug, yr, err)); log.flush()
+                          raise SystemExit(1)
+                  except SystemExit:
+                      raise
+                  except Exception as e:
+                      err = repr(e)[:120]
+                  log.write("%s %d attempt %d %s\n" % (slug, yr, a, err)); log.flush()
+                  time.sleep(60)
+          log.close()
+          PY
+          python3 q.py
+      - name: Name the artifact
+        if: always()
+        run: echo "ART=${TAG_}" >> $GITHUB_ENV
+        env:
+          TERM_: ${{ matrix.term }}
+          TAG_: ${{ matrix.tag }}_${{ matrix.ytag }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gdelt-cyber1-${{ env.ART }}
+          path: out/
 
