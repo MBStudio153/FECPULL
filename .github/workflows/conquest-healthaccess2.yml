@@ -1,1 +1,66 @@
+name: conquest-healthaccess2
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+      CENSUS_API_KEY: ${{ secrets.CENSUS_API_KEY }}
+    steps:
+      - name: "Health coverage and cost: Census SAHIE (needs CENSUS_API_KEY secret), World Bank, FRED API"
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import os, time, urllib.request
+          UA = {"User-Agent": "kaim-research/1.0"}
+          log = open("out/log.txt", "w")
+          def save(fn, u, show):
+              for a in range(3):
+                  try:
+                      r = urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=60).read()
+                      if r[:5].lower() in (b"<html", b"<!doc"):
+                          log.write("%s ERROR page returned, not data (first bytes %r)\n" % (fn, r[:60])); break
+                      open("out/" + fn, "wb").write(r)
+                      log.write("%s ok %d bytes\n" % (fn, len(r))); break
+                  except Exception as e:
+                      log.write("%s attempt %d %s\n" % (fn, a, repr(e).replace(os.environ.get("CENSUS_API_KEY") or "~none~", "***").replace(fk, "***")[:100])); time.sleep(10 * (a + 1))
+              log.flush(); time.sleep(1)
+          fk = os.environ["FRED_API_KEY"]
+          ck = os.environ["CENSUS_API_KEY"]
+          save("sahie_us_2008.json", "https://api.census.gov/data/timeseries/healthins/sahie?get=NAME,PCTUI_PT,NUI_PT,NIPR_PT&for=us:*&time=2008&key=" + ck, None)
+          save("sahie_us_2009.json", "https://api.census.gov/data/timeseries/healthins/sahie?get=NAME,PCTUI_PT,NUI_PT,NIPR_PT&for=us:*&time=2009&key=" + ck, None)
+          save("sahie_us_2010.json", "https://api.census.gov/data/timeseries/healthins/sahie?get=NAME,PCTUI_PT,NUI_PT,NIPR_PT&for=us:*&time=2010&key=" + ck, None)
+          save("sahie_us_2011.json", "https://api.census.gov/data/timeseries/healthins/sahie?get=NAME,PCTUI_PT,NUI_PT,NIPR_PT&for=us:*&time=2011&key=" + ck, None)
+          save("sahie_us_2012.json", "https://api.census.gov/data/timeseries/healthins/sahie?get=NAME,PCTUI_PT,NUI_PT,NIPR_PT&for=us:*&time=2012&key=" + ck, None)
+          save("sahie_us_2013.json", "https://api.census.gov/data/timeseries/healthins/sahie?get=NAME,PCTUI_PT,NUI_PT,NIPR_PT&for=us:*&time=2013&key=" + ck, None)
+          save("sahie_us_2014.json", "https://api.census.gov/data/timeseries/healthins/sahie?get=NAME,PCTUI_PT,NUI_PT,NIPR_PT&for=us:*&time=2014&key=" + ck, None)
+          save("sahie_us_2015.json", "https://api.census.gov/data/timeseries/healthins/sahie?get=NAME,PCTUI_PT,NUI_PT,NIPR_PT&for=us:*&time=2015&key=" + ck, None)
+          save("sahie_us_2016.json", "https://api.census.gov/data/timeseries/healthins/sahie?get=NAME,PCTUI_PT,NUI_PT,NIPR_PT&for=us:*&time=2016&key=" + ck, None)
+          save("sahie_us_2017.json", "https://api.census.gov/data/timeseries/healthins/sahie?get=NAME,PCTUI_PT,NUI_PT,NIPR_PT&for=us:*&time=2017&key=" + ck, None)
+          save("sahie_us_2018.json", "https://api.census.gov/data/timeseries/healthins/sahie?get=NAME,PCTUI_PT,NUI_PT,NIPR_PT&for=us:*&time=2018&key=" + ck, None)
+          save("sahie_us_2019.json", "https://api.census.gov/data/timeseries/healthins/sahie?get=NAME,PCTUI_PT,NUI_PT,NIPR_PT&for=us:*&time=2019&key=" + ck, None)
+          save("sahie_us_2020.json", "https://api.census.gov/data/timeseries/healthins/sahie?get=NAME,PCTUI_PT,NUI_PT,NIPR_PT&for=us:*&time=2020&key=" + ck, None)
+          save("sahie_us_2021.json", "https://api.census.gov/data/timeseries/healthins/sahie?get=NAME,PCTUI_PT,NUI_PT,NIPR_PT&for=us:*&time=2021&key=" + ck, None)
+          save("sahie_us_2022.json", "https://api.census.gov/data/timeseries/healthins/sahie?get=NAME,PCTUI_PT,NUI_PT,NIPR_PT&for=us:*&time=2022&key=" + ck, None)
+          save("sahie_us_2023.json", "https://api.census.gov/data/timeseries/healthins/sahie?get=NAME,PCTUI_PT,NUI_PT,NIPR_PT&for=us:*&time=2023&key=" + ck, None)
+          save("wdi_health_exp_gdp.json", "https://api.worldbank.org/v2/country/all/indicator/SH.XPD.CHEX.GD.ZS?format=json&per_page=20000&date=1960:2025", None)
+          save("wdi_oop_health.json", "https://api.worldbank.org/v2/country/all/indicator/SH.XPD.OOPC.CH.ZS?format=json&per_page=20000&date=1960:2025", None)
+          save("fred_CUSR0000SAM.json", "https://api.stlouisfed.org/fred/series/observations?series_id=CUSR0000SAM&api_key=" + fk + "&file_type=json", None)
+          save("fred_CUSR0000SEMD01.json", "https://api.stlouisfed.org/fred/series/observations?series_id=CUSR0000SEMD01&api_key=" + fk + "&file_type=json", None)
+          save("fred_CUSR0000SEME.json", "https://api.stlouisfed.org/fred/series/observations?series_id=CUSR0000SEME&api_key=" + fk + "&file_type=json", None)
+          save("fred_CUSR0000SAM1.json", "https://api.stlouisfed.org/fred/series/observations?series_id=CUSR0000SAM1&api_key=" + fk + "&file_type=json", None)
+          save("fred_CUSR0000SEMF01.json", "https://api.stlouisfed.org/fred/series/observations?series_id=CUSR0000SEMF01&api_key=" + fk + "&file_type=json", None)
+          save("fred_HLTHSCPCHCSA.json", "https://api.stlouisfed.org/fred/series/observations?series_id=HLTHSCPCHCSA&api_key=" + fk + "&file_type=json", None)
+          PY
+          python3 q.py || true
+          ls -la out
+          cat out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conquest-healthaccess2
+          path: out/
 
