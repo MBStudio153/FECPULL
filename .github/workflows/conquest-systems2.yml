@@ -1,1 +1,43 @@
+name: conquest-systems2
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - name: "Federal outlays and receipts and government spending from FRED API"
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import os, time, urllib.request
+          UA = {"User-Agent": "kaim-research/1.0"}
+          log = open("out/log.txt", "w")
+          def save(fn, u, show):
+              for a in range(3):
+                  try:
+                      r = urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=60).read()
+                      if r[:5].lower() in (b"<html", b"<!doc"):
+                          log.write("%s ERROR page returned, not data (first bytes %r)\n" % (fn, r[:60])); break
+                      open("out/" + fn, "wb").write(r)
+                      log.write("%s ok %d bytes\n" % (fn, len(r))); break
+                  except Exception as e:
+                      log.write("%s attempt %d %s\n" % (fn, a, repr(e)[:100])); time.sleep(10 * (a + 1))
+              log.flush(); time.sleep(1)
+          fk = os.environ["FRED_API_KEY"]
+          save("fred_FYONGDA188S.json", "https://api.stlouisfed.org/fred/series/observations?series_id=FYONGDA188S&api_key=" + fk + "&file_type=json", None)
+          save("fred_FYFRGDA188S.json", "https://api.stlouisfed.org/fred/series/observations?series_id=FYFRGDA188S&api_key=" + fk + "&file_type=json", None)
+          save("fred_GEXPND.json", "https://api.stlouisfed.org/fred/series/observations?series_id=GEXPND&api_key=" + fk + "&file_type=json", None)
+          PY
+          python3 q.py || true
+          ls -la out
+          cat out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conquest-systems2
+          path: out/
 
