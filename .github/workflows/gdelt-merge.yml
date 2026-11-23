@@ -1,1 +1,40 @@
+name: gdelt-merge
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Run number from the web address of the finished run (the long number after /runs/)"
+        required: true
+      pattern:
+        description: "Only merge artifacts whose names match this (default: all)"
+        required: false
+        default: "*"
+permissions:
+  actions: read
+  contents: read
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download every artifact of that run
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          pattern: ${{ inputs.pattern }}
+          path: merged
+      - name: Count what came down
+        run: |
+          echo "artifact folders: $(ls merged | wc -l)"
+          echo "files: $(find merged -type f | wc -l)"
+          du -sh merged
+      - name: Upload as one artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-run-${{ inputs.run_id }}
+          path: merged
+          retention-days: 3
+          compression-level: 6
 
