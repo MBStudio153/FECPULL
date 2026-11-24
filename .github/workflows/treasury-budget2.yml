@@ -1,0 +1,48 @@
+name: treasury-budget1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Treasury Fiscal Data API, Monthly Treasury Statement tables 1, 4, 5 and 9 (receipts, outlays, deficit)
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, time, urllib.request
+          log = open("out/log.txt", "w")
+          BASE = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/mts/"
+          def get(url):
+              for a in range(4):
+                  try:
+                      return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "kaim-research/1.0"}), timeout=120).read().decode()
+                  except Exception as e:
+                      log.write("%s attempt %d %r\n" % (url, a, e)); log.flush(); time.sleep(5 * (a + 1))
+              return None
+          for t in ("mts_table_1", "mts_table_4", "mts_table_5", "mts_table_9"):
+              rows = []; page = 1; pages = 1
+              while page <= pages:
+                  txt = get(BASE + t + "?sort=record_date&page[size]=10000&page[number]=%d" % page)
+                  if not txt:
+                      log.write("FAIL %s page %d\n" % (t, page)); break
+                  j = json.loads(txt)
+                  rows += j.get("data", [])
+                  pages = j.get("meta", {}).get("total-pages", 1)
+                  page += 1
+              if rows:
+                  json.dump(rows, open("out/%s.json" % t, "w"))
+                  log.write("OK   %s  %d rows  %s to %s\n" % (t, len(rows), rows[0]["record_date"], rows[-1]["record_date"]))
+              log.flush()
+          log.close()
+          PY
+          python3 q.py
+          cat out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: treasury-budget1
+          path: out/
+          retention-days: 3
+
