@@ -1,1 +1,29 @@
+name: omb-mandatory1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: OMB Historical Tables, FY 2027 edition (tables 1.1, 3.2, 8.1, 8.5 and 8.6)
+        run: |
+          mkdir -p out
+          B=https://www.whitehouse.gov/wp-content/uploads/2026/04
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+          for f in hist01z1_fy2027 hist03z2_fy2027 hist08z1_fy2027 hist08z5_fy2027 hist08z6_fy2027; do
+            code=$(curl -sS -L --retry 3 --retry-delay 5 -A "$UA" -o out/$f.xlsx -w "%{http_code}" $B/$f.xlsx || echo "curl-error")
+            echo "$f  http $code  $(stat -c %s out/$f.xlsx 2>/dev/null || echo 0) bytes" | tee -a out/log.txt
+          done
+          # also the all-tables zip as a fallback
+          code=$(curl -sS -L --retry 3 --retry-delay 5 -A "$UA" -o out/hist_fy2027.zip -w "%{http_code}" $B/hist_fy2027.zip || echo "curl-error")
+          echo "hist_fy2027.zip  http $code  $(stat -c %s out/hist_fy2027.zip 2>/dev/null || echo 0) bytes" | tee -a out/log.txt
+          file out/* | tee -a out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: omb-mandatory1
+          path: out/
+          retention-days: 3
 
