@@ -1,1 +1,68 @@
+name: nass-data-animals1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  animals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        species: [HOGS, CATTLE, SHEEP, GOATS, HORSES, CHICKENS, TURKEYS]
+    steps:
+      - name: NASS Quick Stats API, death loss and inventory rows for one species, national and state, all years
+        env:
+          NASS_KEY: ${{ secrets.NASS_API_KEY }}
+          SPECIES: ${{ matrix.species }}
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import collections, json, os, time, urllib.parse, urllib.request
+          key = os.environ["NASS_KEY"]; sp = os.environ["SPECIES"]
+          log = open("out/log.txt", "w"); rows = []; seen = set()
+          if not key: log.write("NASS_API_KEY secret is empty\n"); log.flush()
+          def call(ep, q):
+              url = "https://quickstats.nass.usda.gov/api/%s/?" % ep + urllib.parse.urlencode(q)
+              for a in range(4):
+                  try:
+                      r = urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "kaim-research/1.0"}), timeout=120).read().decode()
+                      return json.loads(r)
+                  except Exception as e:
+                      log.write("%s %s attempt %d %r\n" % (ep, q.get("short_desc__LIKE") or q.get("statisticcat_desc"), a, e)); log.flush(); time.sleep(8)
+              return None
+          def add(data):
+              n = 0
+              for r in data:
+                  k = (r.get("short_desc"), r.get("year"), r.get("state_alpha"), r.get("agg_level_desc"), r.get("reference_period_desc"), r.get("domaincat_desc"), r.get("Value"))
+                  if k not in seen: seen.add(k); rows.append(r); n += 1
+              return n
+          d = call("get_param_values", {"key": key, "param": "statisticcat_desc", "commodity_desc": sp, "sector_desc": "ANIMALS & PRODUCTS"})
+          log.write("statisticcat values for %s: %r\n" % (sp, d)); log.flush()
+          spans = ((1900, 1979), (1980, 1999), (2000, 2014), (2015, 2026))
+          for w in ("DEATH", "LOSS", "LOST", "MORTAL"):
+              for y0, y1 in spans:
+                  q = {"key": key, "commodity_desc": sp, "short_desc__LIKE": w, "year__GE": str(y0), "year__LE": str(y1), "format": "JSON"}
+                  data = (call("api_GET", q) or {}).get("data", [])
+                  log.write("%s %s %d-%d: %d rows, %d new\n" % (sp, w, y0, y1, len(data), add(data))); log.flush()
+                  time.sleep(1)
+          for lvl in ("NATIONAL", "STATE"):
+              for y0, y1 in spans:
+                  q = {"key": key, "commodity_desc": sp, "statisticcat_desc": "INVENTORY", "agg_level_desc": lvl, "freq_desc": "ANNUAL", "domain_desc": "TOTAL", "year__GE": str(y0), "year__LE": str(y1), "format": "JSON"}
+                  data = (call("api_GET", q) or {}).get("data", [])
+                  log.write("%s INVENTORY %s %d-%d: %d rows, %d new\n" % (sp, lvl, y0, y1, len(data), add(data))); log.flush()
+                  time.sleep(1)
+          json.dump(rows, open("out/nass_%s_animals.json" % sp.lower(), "w"))
+          log.write("total %d unique rows\n" % len(rows))
+          for k, v in collections.Counter(r.get("short_desc") for r in rows).most_common(60): log.write("%6d  %s\n" % (v, k))
+          log.close()
+          PY
+          python3 q.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nass-data-animals1-${{ matrix.species }}
+          path: out/
+          retention-days: 3
 
