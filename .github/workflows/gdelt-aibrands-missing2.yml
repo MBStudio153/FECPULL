@@ -1,1 +1,73 @@
+name: gdelt-aibrands2-missing
+on: workflow_dispatch
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        include: [{"term": "chatgpt", "tag": "chatgpt", "grp": "aibrands", "query": "\"chatgpt\"", "years": "2017", "ytag": "2017"}, {"term": "chatgpt", "tag": "chatgpt", "grp": "aibrands", "query": "\"chatgpt\"", "years": "2018", "ytag": "2018"}, {"term": "chatgpt", "tag": "chatgpt", "grp": "aibrands", "query": "\"chatgpt\"", "years": "2019", "ytag": "2019"}, {"term": "chatgpt", "tag": "chatgpt", "grp": "aibrands", "query": "\"chatgpt\"", "years": "2020", "ytag": "2020"}, {"term": "chatgpt", "tag": "chatgpt", "grp": "aibrands", "query": "\"chatgpt\"", "years": "2021", "ytag": "2021"}, {"term": "google_gemini", "tag": "google_gemini", "grp": "aibrands", "query": "\"google gemini\"", "years": "2019", "ytag": "2019"}, {"term": "google_gemini", "tag": "google_gemini", "grp": "aibrands", "query": "\"google gemini\"", "years": "2020", "ytag": "2020"}, {"term": "google_gemini", "tag": "google_gemini", "grp": "aibrands", "query": "\"google gemini\"", "years": "2022", "ytag": "2022"}, {"term": "microsoft_copilot", "tag": "microsoft_copilot", "grp": "aibrands", "query": "\"microsoft copilot\"", "years": "2019", "ytag": "2019"}, {"term": "microsoft_copilot", "tag": "microsoft_copilot", "grp": "aibrands", "query": "\"microsoft copilot\"", "years": "2020", "ytag": "2020"}]
+    steps:
+      - name: GDELT DOC API, retry of empty AI brand years, one year per job
+        continue-on-error: true
+        env:
+          TERM_: ${{ matrix.term }}
+          QUERY_: ${{ matrix.query }}
+          YEARS_: ${{ matrix.years }}
+          GRP_: ${{ matrix.grp }}
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import os, re, time, urllib.request, urllib.parse, random
+          term = os.environ["TERM_"]
+          slug = re.sub("[^a-z0-9]+", "_", term.lower()).strip("_")
+          log = open("out/log.txt", "w")
+          time.sleep(random.randint(0, 45))
+          q = os.environ["QUERY_"] + " sourcelang:english"
+          for yr in [int(y) for y in os.environ["YEARS_"].split(",")]:
+              start = "%d0101000000" % yr
+              end = "%d1231235959" % yr
+              params = {"query": q, "mode": "timelinevolraw", "format": "json", "timelinesmooth": "0", "startdatetime": start, "enddatetime": end}
+              url = "https://api.gdeltproject.org/api/v2/doc/doc?" + urllib.parse.urlencode(params)
+              last = None
+              empties = 0
+              for a in range(30):
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": "kaim-research/1.0"})
+                      r = urllib.request.urlopen(req, timeout=180).read().decode("utf-8", "replace")
+                      if r.startswith("{"):
+                          last = r
+                          if len(r) > 20:
+                              log.write("%s %d ok len=%d\n" % (slug, yr, len(r))); log.flush()
+                              break
+                          empties += 1
+                          log.write("%s %d attempt %d empty reply (%d of 3)\n" % (slug, yr, a, empties)); log.flush()
+                          if empties >= 3:
+                              break
+                          time.sleep(60)
+                          continue
+                      err = r[:80]
+                  except Exception as e:
+                      err = repr(e)[:120]
+                  log.write("%s %d attempt %d %s\n" % (slug, yr, a, err)); log.flush()
+                  time.sleep(60)
+              if last is not None:
+                  open("out/topic_%s__%s_%d.json" % (os.environ["GRP_"], slug, yr), "w").write(last)
+                  log.write("%s %d saved len=%d\n" % (slug, yr, len(last))); log.flush()
+          log.close()
+          PY
+          python3 q.py
+      - name: Name the artifact
+        if: always()
+        run: echo "ART=${TAG_}" >> $GITHUB_ENV
+        env:
+          TAG_: ${{ matrix.tag }}_${{ matrix.ytag }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gdelt-aibrands2-${{ env.ART }}
+          path: out/
+          retention-days: 3
 
