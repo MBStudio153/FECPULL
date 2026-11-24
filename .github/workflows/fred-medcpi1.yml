@@ -1,1 +1,69 @@
-
+name: fred-medcpi1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - name: FRED API, medical care CPI series with corrected IDs, plus a search for IDs that failed
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, os, time, urllib.parse, urllib.request
+          fk = os.environ["FRED_API_KEY"]
+          log = open("out/log.txt", "w")
+          if not fk: log.write("FRED_API_KEY secret is empty\n"); log.flush()
+          def get(path, **q):
+              q.update(api_key=fk, file_type="json")
+              url = "https://api.stlouisfed.org/fred/" + path + "?" + urllib.parse.urlencode(q)
+              for a in range(3):
+                  try:
+                      return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "kaim-research/1.0"}), timeout=120).read().decode()
+                  except Exception as e:
+                      log.write("%s %s attempt %d %r\n" % (path, q.get("series_id") or q.get("search_text"), a, e)); log.flush(); time.sleep(4)
+              return None
+          # target, candidate ids to try in order (every one that works is saved)
+          cands = [
+              ("medical care services", ["CUSR0000SAM2", "CUUR0000SAM2"]),
+              ("medical care total", ["CPIMEDSL", "CUUR0000SAM"]),
+              ("hospital and related services", ["CUSR0000SEMD", "CUUR0000SEMD"]),
+              ("health insurance", ["CUSR0000SEME", "CUUR0000SEME"]),
+              ("prescription drugs", ["CUSR0000SEMF01", "CUUR0000SEMF01", "CUUR0000SEMF"]),
+              ("medical care commodities (the series earlier labeled services)", ["CUSR0000SAM1"]),
+          ]
+          for label, ids in cands:
+              for sid in ids:
+                  txt = get("series/observations", series_id=sid)
+                  meta = get("series", series_id=sid)
+                  if txt:
+                      open("out/fred_%s.json" % sid, "w").write(txt)
+                      title = ""
+                      try: title = json.loads(meta)["seriess"][0]["title"]
+                      except Exception: pass
+                      log.write("OK   %s  %s  %d bytes  %s\n" % (label, sid, len(txt), title)); log.flush()
+                  else:
+                      log.write("FAIL %s  %s\n" % (label, sid)); log.flush()
+          # search so the real IDs show up in the log even if a guess above failed
+          for text in ("consumer price index health insurance", "consumer price index prescription drugs", "consumer price index hospital services", "consumer price index medical care"):
+              s = get("series/search", search_text=text, limit=25, order_by="popularity", sort_order="desc")
+              if s:
+                  open("out/search_%s.json" % text.replace(" ", "_"), "w").write(s)
+                  try:
+                      for r in json.loads(s)["seriess"]:
+                          log.write("SEARCH %s | %s | %s | %s | %s to %s\n" % (text, r["id"], r["title"], r.get("seasonal_adjustment_short"), r.get("observation_start"), r.get("observation_end")))
+                  except Exception as e:
+                      log.write("search parse %r\n" % e)
+              log.flush()
+          log.close()
+          PY
+          python3 q.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fred-medcpi1
+          path: out/
+          retention-days: 3
