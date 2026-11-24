@@ -1,1 +1,76 @@
+name: fred-budget1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - name: FRED API, federal receipts, outlays, deficit, interest and GDP (fiscal year and calendar year)
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, os, time, urllib.parse, urllib.request
+          fk = os.environ["FRED_API_KEY"]
+          log = open("out/log.txt", "w")
+          if not fk: log.write("FRED_API_KEY secret is empty\n"); log.flush()
+          def get(path, **q):
+              q.update(api_key=fk, file_type="json")
+              url = "https://api.stlouisfed.org/fred/" + path + "?" + urllib.parse.urlencode(q)
+              for a in range(3):
+                  try:
+                      return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "kaim-research/1.0"}), timeout=120).read().decode()
+                  except Exception as e:
+                      log.write("%s %s attempt %d %r\n" % (path, q.get("series_id"), a, e)); log.flush(); time.sleep(4)
+              return None
+          ids = [
+              "FYFR",         # federal receipts, fiscal year, millions of dollars
+              "FYONET",       # federal net outlays, fiscal year, millions of dollars
+              "FYFSD",        # federal surplus or deficit, fiscal year, millions of dollars
+              "FYOINT",       # federal outlays: interest, fiscal year, millions of dollars
+              "GDPA",         # GDP, annual, billions of dollars
+              "GDP",          # GDP, quarterly, billions of dollars, SAAR
+              "FYFSGDA188S",  # FRED's own deficit as percent of GDP, for cross-checking
+              "FYFRGDA188S",  # receipts as percent of GDP
+              "FYONGDA188S",  # net outlays as percent of GDP
+              "FYOIGDA188S",  # interest as percent of GDP
+              "MTSDS133FMS",  # monthly surplus or deficit, millions of dollars
+              "MTSR133FMS",   # monthly receipts
+              "MTSO133FMS",   # monthly outlays
+          ]
+          for sid in ids:
+              txt = get("series/observations", series_id=sid)
+              meta = get("series", series_id=sid)
+              if txt:
+                  open("out/fred_%s.json" % sid, "w").write(txt)
+                  title = ""
+                  try: title = json.loads(meta)["seriess"][0]["title"]
+                  except Exception: pass
+                  obs = [o for o in json.loads(txt)["observations"] if o["value"] != "."]
+                  log.write("OK   %s  %d obs  %s to %s  %s\n" % (sid, len(obs), obs[0]["date"], obs[-1]["date"], title)); log.flush()
+              else:
+                  log.write("FAIL %s\n" % sid); log.flush()
+          # search so real IDs show up in the log if a guess failed
+          for text in ("federal outlays mandatory", "federal outlays social security", "federal outlays medicare", "federal outlays medicaid"):
+              s = get("series/search", search_text=text, limit=15, order_by="popularity", sort_order="desc")
+              if s:
+                  try:
+                      for r in json.loads(s)["seriess"]:
+                          log.write("SEARCH %s | %s | %s | %s | %s to %s\n" % (text, r["id"], r["title"], r.get("units_short"), r.get("observation_start"), r.get("observation_end")))
+                  except Exception as e:
+                      log.write("search parse %r\n" % e)
+              log.flush()
+          log.close()
+          PY
+          python3 q.py
+          cat out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fred-budget1
+          path: out/
+          retention-days: 3
 
