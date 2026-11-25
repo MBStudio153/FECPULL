@@ -1,1 +1,82 @@
+name: nadac1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  nadac:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        year: [2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026]
+    steps:
+      - name: CMS NADAC weekly drug acquisition cost file for one year, monthly averages per NDC (brand and generic flags) plus every acetaminophen row
+        env:
+          YEAR_: ${{ matrix.year }}
+        run: |
+          mkdir -p out raw
+          cat > q.py <<'PY'
+          import csv, gzip, json, os, re, subprocess, urllib.parse, urllib.request, collections
+          yr = os.environ["YEAR_"]
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush(); print(s)
+          urls = []
+          # 1. find the file through the data.gov catalog
+          for q in ('title:"NADAC (National Average Drug Acquisition Cost) %s"' % yr, "NADAC National Average Drug Acquisition Cost %s" % yr):
+              try:
+                  u = "https://catalog.data.gov/api/3/action/package_search?rows=20&q=" + urllib.parse.quote(q)
+                  j = json.loads(urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": "kaim-research/1.0"}), timeout=120).read().decode())
+                  for p in j["result"]["results"]:
+                      if yr in p.get("title", "") and "NADAC" in p.get("title", "").upper() and "TEST" not in p.get("title", "").upper():
+                          for r in p.get("resources", []):
+                              if (r.get("url") or "").lower().endswith(".csv"): urls.append(r["url"])
+              except Exception as e:
+                  L("catalog search failed %r" % e)
+              if urls: break
+          # 2. fall back to the file names seen for recent years
+          known = {"2024": ["https://download.medicaid.gov/data/nadac-national-average-drug-acquisition-cost-12-25-2024.csv"],
+                   "2025": ["https://download.medicaid.gov/data/nadac-national-average-drug-acquisition-cost-12-31-2025.csv"],
+                   "2026": ["https://download.medicaid.gov/data/nadac-national-average-drug-acquisition-cost-02-11-2026.csv"]}
+          urls += known.get(yr, [])
+          L("candidate urls: %r" % urls)
+          got = None
+          for u in urls:
+              r = subprocess.run(["curl", "-sS", "-L", "--retry", "3", "--retry-delay", "5", "-A", "Mozilla/5.0", "-o", "raw/f.csv", "-w", "%{http_code}", u], capture_output=True, text=True)
+              L("GET %s -> %s %s" % (u, r.stdout, r.stderr[:100]))
+              if r.stdout.strip() == "200" and os.path.getsize("raw/f.csv") > 100000:
+                  got = u; break
+          if not got:
+              L("NO FILE for %s" % yr); raise SystemExit(0)
+          f = open("raw/f.csv", newline="", encoding="utf-8-sig", errors="replace")
+          rd = csv.DictReader(f)
+          cols = {re.sub("[^a-z0-9]+", "_", c.lower()).strip("_"): c for c in rd.fieldnames}
+          L("columns: %r" % list(cols))
+          g = lambda row, k: row.get(cols.get(k, ""), "")
+          agg = {}; ace = csv.writer(gzip.open("out/acetaminophen_%s.csv.gz" % yr, "wt")); ace.writerow(rd.fieldnames)
+          n = 0
+          for row in rd:
+              n += 1
+              d = g(row, "effective_date")
+              m = d[:7] if re.match(r"\d{4}-\d{2}", d) else (d[6:10] + "-" + d[0:2] if re.match(r"\d{2}/\d{2}/\d{4}", d) else "")
+              try: p = float(g(row, "nadac_per_unit"))
+              except Exception: continue
+              desc = g(row, "ndc_description")
+              if "ACETAMINOPHEN" in desc.upper(): ace.writerow([row[c] for c in rd.fieldnames])
+              k = (g(row, "ndc"), m)
+              a = agg.setdefault(k, [desc, g(row, "classification_for_rate_setting"), g(row, "otc"), g(row, "pricing_unit"), 0.0, 0])
+              a[4] += p; a[5] += 1
+          w = csv.writer(gzip.open("out/nadac_monthly_%s.csv.gz" % yr, "wt"))
+          w.writerow(["ndc", "month", "ndc_description", "classification_B_G_or_other", "otc", "pricing_unit", "mean_nadac_per_unit", "weekly_rows"])
+          for (ndc, m), a in sorted(agg.items()): w.writerow([ndc, m, a[0], a[1], a[2], a[3], round(a[4] / a[5], 6), a[5]])
+          L("rows read %d, ndc-months %d, from %s" % (n, len(agg), got))
+          PY
+          python3 q.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nadac1-${{ matrix.year }}
+          path: out/
+          retention-days: 3
 
