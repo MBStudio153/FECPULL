@@ -1,1 +1,43 @@
+name: orange-book1
+on:
+  workflow_dispatch:
+
+jobs:
+  orange-book:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download FDA Orange Book data files
+        run: |
+          mkdir -p out/ob
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+          curl -sL -A "$UA" -o out/ob/orange-book.zip -w "HTTP %{http_code} size %{size_download}\n" "https://www.fda.gov/media/76860/download?attachment"
+          ls -l out/ob
+          cd out/ob && unzip -o orange-book.zip || true
+          ls -l
+          for f in *.txt; do echo "== $f"; wc -l "$f"; head -3 "$f"; done
+          date -u > downloaded_at_utc.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orange-book1
+          path: out/ob
+          retention-days: 3
+
+  ndc-directory:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download FDA NDC directory text files
+        run: |
+          mkdir -p out/ndc
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+          curl -sL -A "$UA" -o out/ndc/ndctext.zip -w "HTTP %{http_code} size %{size_download}\n" "https://www.accessdata.fda.gov/cder/ndctext.zip"
+          ls -l out/ndc
+          cd out/ndc && unzip -o ndctext.zip || true
+          ls -l
+          for f in *.txt; do echo "== $f"; wc -l "$f"; head -3 "$f"; done
+          date -u > downloaded_at_utc.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ndc-directory1
+          path: out/ndc
+          retention-days: 3
 
