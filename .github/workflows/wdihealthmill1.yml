@@ -1,1 +1,64 @@
+name: wdi-healthmil1
+on: workflow_dispatch
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        ind:
+          - SH.XPD.CHEX.PC.CD
+          - SH.XPD.CHEX.PP.CD
+          - MS.MIL.XPND.CD
+          - MS.MIL.XPND.GD.ZS
+          - SP.POP.TOTL
+          - NY.GDP.MKTP.CD
+    steps:
+      - name: World Bank WDI, all countries and aggregates, 1960 to latest
+        continue-on-error: true
+        env:
+          IND_: ${{ matrix.ind }}
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import os, json, time, urllib.request
+          ind = os.environ["IND_"]
+          log = open("out/log.txt", "w")
+          rows = []
+          page = 1
+          while True:
+              url = "https://api.worldbank.org/v2/country/all/indicator/%s?format=json&per_page=5000&date=1960:2026&page=%d" % (ind, page)
+              txt = None
+              for a in range(5):
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": "kaim-research/1.0"})
+                      txt = urllib.request.urlopen(req, timeout=120).read().decode("utf-8", "replace")
+                      break
+                  except Exception as e:
+                      log.write("%s page %d attempt %d %r\n" % (ind, page, a, e)); log.flush()
+                      time.sleep(20)
+              if txt is None:
+                  log.write("GAVE UP at page %d\n" % page); break
+              d = json.loads(txt)
+              if not isinstance(d, list) or len(d) < 2 or d[1] is None:
+                  log.write("unexpected response page %d: %s\n" % (page, txt[:200])); break
+              meta, data = d[0], d[1]
+              rows += data
+              log.write("%s page %d/%s rows so far %d\n" % (ind, page, meta.get("pages"), len(rows))); log.flush()
+              if page >= int(meta.get("pages", 1)): break
+              page += 1
+          json.dump(rows, open("out/%s.json" % ind, "w"))
+          log.write("saved %d rows\n" % len(rows))
+          log.close()
+          PY
+          python3 q.py
+          cat out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wdi-healthmil1-${{ matrix.ind }}
+          path: out/
+          retention-days: 3
 
