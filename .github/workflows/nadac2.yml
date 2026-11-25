@@ -1,1 +1,86 @@
+name: nadac2
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  nadac:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        year: [2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026]
+    steps:
+      - name: CMS NADAC weekly drug acquisition cost file for one year (known download addresses, files closed properly), monthly averages per NDC (brand and generic flags) plus every acetaminophen row
+        env:
+          YEAR_: ${{ matrix.year }}
+        run: |
+          mkdir -p out raw
+          cat > q.py <<'PY'
+          import csv, gzip, json, os, re, subprocess, urllib.parse, urllib.request, collections
+          yr = os.environ["YEAR_"]
+          log = open("out/log.txt", "w")
+          def L(s): log.write(s + "\n"); log.flush(); print(s)
+          D = "https://download.medicaid.gov/data/"
+          A = "nadac-national-average-drug-acquisition-cost.a4y5-998d."
+          known = {
+              "2013": [D + A + "1fe73992-cbfd-5109-97bc-dee8b33fdcff.csv"],
+              "2014": [D + A + "ba0c3734-8012-549a-8f50-2ff389d0e0ef.csv"],
+              "2015": [D + A + "4d7af295-2132-55a8-b40c-d6630061f3e8.csv"],
+              "2016": [D + A + "7656fc17-f1b4-566b-9a2d-c4a4f2ac7ae1.csv"],
+              "2017": [D + A + "1c5d0fc9-693a-534a-8240-4627d9362b0d.csv"],
+              "2018": [D + A + "8de1b213-73c5-552b-b84e-ac795f34d056.csv"],
+              "2019": [D + A + "76a1984a-6d69-5e4d-86c8-65eb31f0506d.csv"],
+              "2020": [D + A + "c933dc16-7de9-52b6-8971-4b75992673e0.csv"],
+              "2021": [D + "national-average-drug-acquisition-cost-12-29-2021.csv"],
+              "2022": [D + "nadac-national-average-drug-acquisition-cost-2022.csv"],
+              "2023": [D + "nadac-national-average-drug-acquisition-cost-12-27-2023.csv"],
+              "2024": [D + "nadac-national-average-drug-acquisition-cost-12-25-2024.csv"],
+              "2025": [D + "nadac-national-average-drug-acquisition-cost-12-31-2025.csv"],
+              "2026": [D + "nadac-national-average-drug-acquisition-cost-09-23-2026.csv", D + "nadac-national-average-drug-acquisition-cost-02-11-2026.csv"],
+          }
+          urls = known.get(yr, [])
+          L("candidate urls: %r" % urls)
+          got = None
+          for u in urls:
+              r = subprocess.run(["curl", "-sS", "-L", "--retry", "3", "--retry-delay", "5", "-A", "Mozilla/5.0", "-o", "raw/f.csv", "-w", "%{http_code}", u], capture_output=True, text=True)
+              L("GET %s -> %s %s" % (u, r.stdout, r.stderr[:100]))
+              if r.stdout.strip() == "200" and os.path.getsize("raw/f.csv") > 100000:
+                  got = u; break
+          if not got:
+              L("NO FILE for %s" % yr); raise SystemExit(0)
+          f = open("raw/f.csv", newline="", encoding="utf-8-sig", errors="replace")
+          rd = csv.DictReader(f)
+          cols = {re.sub("[^a-z0-9]+", "_", c.lower()).strip("_"): c for c in rd.fieldnames}
+          L("columns: %r" % list(cols))
+          g = lambda row, k: row.get(cols.get(k, ""), "")
+          agg = {}; acef = gzip.open("out/acetaminophen_%s.csv.gz" % yr, "wt", newline=""); ace = csv.writer(acef); ace.writerow(rd.fieldnames)
+          n = 0
+          for row in rd:
+              n += 1
+              d = g(row, "effective_date")
+              m = d[:7] if re.match(r"\d{4}-\d{2}", d) else (d[6:10] + "-" + d[0:2] if re.match(r"\d{2}/\d{2}/\d{4}", d) else "")
+              try: p = float(g(row, "nadac_per_unit"))
+              except Exception: continue
+              desc = g(row, "ndc_description")
+              if "ACETAMINOPHEN" in desc.upper(): ace.writerow([row[c] for c in rd.fieldnames])
+              k = (g(row, "ndc"), m)
+              a = agg.setdefault(k, [desc, g(row, "classification_for_rate_setting"), g(row, "otc"), g(row, "pricing_unit"), 0.0, 0])
+              a[4] += p; a[5] += 1
+          acef.close()
+          wf = gzip.open("out/nadac_monthly_%s.csv.gz" % yr, "wt", newline="")
+          w = csv.writer(wf)
+          w.writerow(["ndc", "month", "ndc_description", "classification_B_G_or_other", "otc", "pricing_unit", "mean_nadac_per_unit", "weekly_rows"])
+          for (ndc, m), a in sorted(agg.items()): w.writerow([ndc, m, a[0], a[1], a[2], a[3], round(a[4] / a[5], 6), a[5]])
+          wf.close()
+          L("rows read %d, ndc-months %d, from %s" % (n, len(agg), got))
+          PY
+          python3 q.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nadac2-${{ matrix.year }}
+          path: out/
+          retention-days: 3
 
