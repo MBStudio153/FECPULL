@@ -1,1 +1,53 @@
+name: orange-book2
+on:
+  workflow_dispatch:
+
+jobs:
+  orange-book:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download FDA Orange Book data files
+        shell: bash
+        run: |
+          set +e
+          mkdir -p out/ob
+          cd out/ob
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+          REF="https://www.fda.gov/drugs/drug-approvals-and-databases/orange-book-data-files"
+          n=0
+          for URL in \
+            "https://www.fda.gov/media/76860/download?attachment" \
+            "https://www.fda.gov/media/76860/download" \
+            "https://www.fda.gov/media/76860/file"; do
+            n=$((n+1))
+            echo "=== try $n: $URL"
+            curl -sSL --retry 2 -m 120 -A "$UA" -e "$REF" \
+              -H "Accept: application/zip,application/octet-stream,*/*" \
+              -D "headers_$n.txt" -o "try_$n.bin" \
+              -w "HTTP %{http_code} size %{size_download} type %{content_type} final %{url_effective}\n" "$URL"
+            echo "curl exit $?"
+            file "try_$n.bin"
+            head -c 300 "try_$n.bin" | cat -v | head -5
+            echo
+            if unzip -tq "try_$n.bin" >/dev/null 2>&1; then
+              cp "try_$n.bin" orange-book.zip
+              echo "zip OK from try $n"
+              break
+            fi
+          done
+          if [ -f orange-book.zip ]; then
+            unzip -o orange-book.zip
+            for f in *.txt; do [ -f "$f" ] && { echo "== $f"; wc -l "$f"; head -3 "$f"; }; done
+          else
+            echo "NO VALID ZIP RECEIVED"
+          fi
+          date -u > downloaded_at_utc.txt
+          ls -l
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: orange-book2
+          path: out/ob
+          retention-days: 3
 
