@@ -1,1 +1,72 @@
+name: fred-household1
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - name: FRED API, household counts and Census household income series, plus a search for a mean household income series
+        run: |
+          mkdir -p out
+          cat > q.py <<'PY'
+          import json, os, time, urllib.parse, urllib.request
+          fk = os.environ["FRED_API_KEY"]
+          log = open("out/log.txt", "w")
+          if not fk: log.write("FRED_API_KEY secret is empty\n"); log.flush()
+          def get(path, **q):
+              q.update(api_key=fk, file_type="json")
+              url = "https://api.stlouisfed.org/fred/" + path + "?" + urllib.parse.urlencode(q)
+              for a in range(3):
+                  try:
+                      return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "kaim-research/1.0"}), timeout=120).read().decode()
+                  except Exception as e:
+                      log.write("%s %s attempt %d %r\n" % (path, q.get("series_id") or q.get("search_text"), a, e)); log.flush(); time.sleep(4)
+              return None
+          ids = [
+              "TTLHH",              # total households, thousands
+              "TTLHHM156N",         # total households, Census
+              "MEHOINUSA646N",      # median household income, current dollars
+              "MEHOINUSA672N",      # median household income, 2024 CPI-U-RS dollars
+              "MAFAINUSA646N",      # mean family income, if it exists
+              "MEFAINUSA646N",      # median family income
+              "A229RX0",            # real disposable personal income per capita
+              "A229RC0",            # disposable personal income per capita
+              "POPTHM", "DSPI", "TOTALSL", "REVOLSL", "NONREVSL",
+          ]
+          for sid in ids:
+              txt = get("series/observations", series_id=sid)
+              meta = get("series", series_id=sid)
+              if txt:
+                  open("out/fred_%s.json" % sid, "w").write(txt)
+                  title = units = ""
+                  try:
+                      m = json.loads(meta)["seriess"][0]; title = m["title"]; units = m.get("units_short", "")
+                  except Exception: pass
+                  obs = [o for o in json.loads(txt)["observations"] if o["value"] != "."]
+                  log.write("OK   %s  %d obs  %s to %s  %s  [%s]\n" % (sid, len(obs), obs[0]["date"] if obs else "-", obs[-1]["date"] if obs else "-", title, units)); log.flush()
+              else:
+                  log.write("FAIL %s\n" % sid); log.flush()
+          for text in ("mean household income", "average household income", "number of households", "households total United States", "mean family income"):
+              s = get("series/search", search_text=text, limit=20, order_by="popularity", sort_order="desc")
+              if s:
+                  try:
+                      for r in json.loads(s)["seriess"]:
+                          log.write("SEARCH %s | %s | %s | %s | %s to %s\n" % (text, r["id"], r["title"], r.get("units_short"), r.get("observation_start"), r.get("observation_end")))
+                  except Exception as e:
+                      log.write("search parse %r\n" % e)
+              log.flush()
+          log.close()
+          PY
+          python3 q.py
+          grep -E "^(OK|FAIL)" out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fred-household1
+          path: out/
+          retention-days: 3
 
